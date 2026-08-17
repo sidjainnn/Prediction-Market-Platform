@@ -10,6 +10,8 @@ validation, matching, settlement and payout are all production code — against 
 local Docker stack. The market maker, the pricing curve, the risk instrumentation
 and the hedging integration are what I built around them.
 
+### ▶ [Open the walkthrough →](https://sidjainnn.github.io/Prediction-Market-Platform/)
+
 <p align="center">
   <img src="docs/images/demo.gif" alt="BitBull's live markets view: a 5-minute BTC binary with YES/NO quotes updating as the house market maker requotes off the Binance spot feed" width="100%">
 </p>
