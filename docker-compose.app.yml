@@ -28,6 +28,17 @@ x-node: &node
     dynamodb: { condition: service_started }
 
 services:
+  # The base compose file defines no healthcheck for mysql, so the
+  # `service_healthy` conditions below have nothing to wait on. Add one here:
+  # schema bootstrap fails if it connects before mysql finishes initialising.
+  mysql:
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-plocal"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
   # One-shot: create every table/schema, then exit. Everything else waits on it.
   schema:
     <<: *node
@@ -57,8 +68,14 @@ services:
       schema: { condition: service_completed_successfully }
 
   # Rolling 5-minute at-the-money markets.
+  # LOOP=1 is required: without it the generator creates ONE market and exits(0),
+  # and the restart policy relaunches it — producing a new market every few
+  # seconds instead of one per tenor.
   markets:
     <<: *node
+    environment:
+      <<: *env
+      LOOP: "1"
     command: ["node", "drivers/market-generator/index.mjs"]
     depends_on:
       standalone: { condition: service_started }
@@ -72,6 +89,16 @@ services:
     depends_on:
       standalone: { condition: service_started }
       wallet: { condition: service_started }
+      oracle: { condition: service_started }
+
+  # The house market maker. The app is documented as spawning the persistent
+  # quoter, but it does not do so in-container, so without this service markets
+  # open with no resting liquidity and the book shows no quotes.
+  mmp-pricing:
+    <<: *node
+    command: ["node", "drivers/mmp-pricing/index.mjs"]
+    depends_on:
+      standalone: { condition: service_started }
       oracle: { condition: service_started }
 
   # House inventory → the Redis keys the hedging sidecar reads. Optional.
