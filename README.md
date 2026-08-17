@@ -190,17 +190,21 @@ public registries, `localstack/elasticmq.conf` configures the queues, and
 volumes are deliberately *not* in git — they're regenerable state, and they hold
 user rows.
 
-What a clean clone **cannot** get from here are the four production Predictor
-services on the order path. They live in their own repositories:
+Four services sit on the order path. The originals are production Predictor
+services living in their own repositories, and `standalone/services.mjs` in this
+repo implements the endpoints the app calls from each:
 
-| Service | Port | Role |
-|---|---|---|
-| trading-api | 8080 | order validation and intake |
-| matching-engine | 7001 | order books, matching, LMSR state |
-| distribution-engine | 7002 | settlement and payout |
-| wallet | 3000 | balances (a stub lives here; accounting is genuine) |
+| Service | Port | Role | Endpoint the app uses |
+|---|---|---|---|
+| trading-api | 8080 | order validation and intake | `POST /skillPolls/placeBid` |
+| matching-engine | 7001 | order books, matching | `POST /handle` |
+| distribution-engine | 7002 | settlement and payout | `POST /market-status-change` |
+| wallet | 3000 | balances | `/wallet/{debit,credit,batch-process}` |
 
-Start those, point `run/services.env` at them, and the stack runs end to end.
+`./start.sh` uses the standalone implementations, so a clean clone runs end to
+end with no external dependencies. If you do have the production services,
+point `run/services.env` at them instead — that path is unchanged, and measuring
+against unmodified production code is what this repo was built for.
 
 ### …or run it standalone
 
