@@ -20,3 +20,8 @@ data/*.log
 dist/
 .DS_Store
 localstack/volume/
+
+# live watcher output — appended continuously while the stack runs.
+# Point-in-time snapshots remain in history (commits c7e814c..c8a1914).
+data/liquidity-watch.csv
+research/kalshi_15m.csv
