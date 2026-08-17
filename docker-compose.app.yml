@@ -1,0 +1,82 @@
+# The application tier, on top of the datastores in docker-compose.yml.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.app.yml up -d --build
+#
+# Everything the exchange needs now lives in this repo — the standalone/ services
+# replace the four production services that used to sit on the order path — so a
+# clean clone starts the whole exchange with one command.
+#
+# Host networking is not used: containers reach each other by service name, so
+# the in-container endpoints below override the localhost defaults in
+# setup/local.mjs and run/services.env.
+
+x-node: &node
+  build: .
+  restart: unless-stopped
+  environment: &env
+    REDIS_HOST: redis
+    MYSQL_HOST: mysql
+    DDB_ENDPOINT: http://dynamodb:8000
+    SQS_ENDPOINT: http://sqs:9324
+    TRADING_API: http://standalone:8080
+    MATCHER_URL: http://standalone:7001
+    DIST_URL: http://standalone:7002
+    WALLET_STUB: http://wallet:3000
+  depends_on:
+    redis: { condition: service_started }
+    mysql: { condition: service_healthy }
+    dynamodb: { condition: service_started }
+
+services:
+  # One-shot: create every table/schema, then exit. Everything else waits on it.
+  schema:
+    <<: *node
+    restart: "no"
+    command: ["node", "setup/create-schema.mjs"]
+
+  # The order path: trading-api :8080 · matching-engine :7001 · distribution :7002
+  standalone:
+    <<: *node
+    command: ["node", "standalone/services.mjs"]
+    ports: ["8080:8080", "7001:7001", "7002:7002"]
+    depends_on:
+      schema: { condition: service_completed_successfully }
+
+  wallet:
+    <<: *node
+    command: ["node", "drivers/wallet-stub/index.mjs"]
+    ports: ["3000:3000"]
+    depends_on:
+      schema: { condition: service_completed_successfully }
+
+  # Binance spot → Redis. Required: without it nothing prices or settles.
+  oracle:
+    <<: *node
+    command: ["node", "drivers/oracle-feed/index.mjs"]
+    depends_on:
+      schema: { condition: service_completed_successfully }
+
+  # Rolling 5-minute at-the-money markets.
+  markets:
+    <<: *node
+    command: ["node", "drivers/market-generator/index.mjs"]
+    depends_on:
+      standalone: { condition: service_started }
+
+  # The web app on :5050 — this is what ngrok points at. It also spawns the
+  # persistent quoter (the house market maker).
+  app:
+    <<: *node
+    command: ["node", "app/server.mjs"]
+    ports: ["5050:5050"]
+    depends_on:
+      standalone: { condition: service_started }
+      wallet: { condition: service_started }
+      oracle: { condition: service_started }
+
+  # House inventory → the Redis keys the hedging sidecar reads. Optional.
+  inventory-mirror:
+    <<: *node
+    command: ["node", "drivers/inventory-mirror/index.mjs", "--watch"]
+    depends_on:
+      standalone: { condition: service_started }
