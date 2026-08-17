@@ -94,8 +94,14 @@ services:
   # The house market maker. The app is documented as spawning the persistent
   # quoter, but it does not do so in-container, so without this service markets
   # open with no resting liquidity and the book shows no quotes.
+  # LOOP=1 for the same reason as market-generator: without it the quoter runs a
+  # single pass, exits(0), and the restart policy relaunches it — a fresh process
+  # every few seconds instead of one long-lived quoter re-quoting on an interval.
   mmp-pricing:
     <<: *node
+    environment:
+      <<: *env
+      LOOP: "1"
     command: ["node", "drivers/mmp-pricing/index.mjs"]
     depends_on:
       standalone: { condition: service_started }
