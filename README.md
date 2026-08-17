@@ -127,14 +127,48 @@ Shared libraries in `drivers/lib/`: `pricing.mjs` (fair value) ·
 
 ## Running it
 
-Needs Docker.
+Needs Docker, and nothing else. Clone and start:
+
+```bash
+git clone https://github.com/sidjainnn/Prediction-Market-Platform.git
+cd Prediction-Market-Platform
+./start.sh
+```
+
+That builds one image and brings up the datastores, the schema bootstrap, the
+order path, the wallet, the Binance feed, the market generator and the app on
+**http://localhost:5050**. To put it on a public URL:
+
+```bash
+./start.sh --ngrok        # or, separately: ngrok http 5050
+```
+
+**The order path is self-contained.** `standalone/services.mjs` implements the
+three endpoints the app needs — `trading-api /skillPolls/placeBid`,
+`matching-engine /handle`, `distribution-engine /market-status-change` — against
+the shapes in [`contracts.md`](contracts.md), reusing `drivers/lib`. Matching
+follows the same price-time priority (`ORDER BY bid_amount DESC, row_id`) that
+`drivers/lib/matching.mjs` records as confirmed against the live matcher: a YES
+bid at `p` crosses resting NO rows priced `≥ 100 − p`, best price first, oldest
+first at equal price, and the remainder rests.
+
+Cancels, sells, buyback and ladder markets are out of scope — the app doesn't
+use them.
+
+<details>
+<summary>Running the processes directly instead of in Docker</summary>
 
 ```bash
 cp run/services.env.example run/services.env
-docker compose up -d                 # redis · mysql8 · dynamodb-local · elasticmq · postgres
-node setup/create-schema.mjs         # idempotent bootstrap — creates every table/schema
-node app/server.mjs                  # :5050 — also spawns the persistent quoter
+docker compose up -d                 # datastores only
+node setup/create-schema.mjs         # idempotent bootstrap
+node standalone/services.mjs         # :8080 · :7001 · :7002
+node drivers/wallet-stub/index.mjs   # :3000
+node drivers/oracle-feed/index.mjs   # spot feed (required)
+node drivers/market-generator/index.mjs
+node app/server.mjs                  # :5050
 ```
+</details>
 
 ```bash
 node drivers/oracle-feed/index.mjs           # spot feed (required)
