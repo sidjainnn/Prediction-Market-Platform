@@ -1,21 +1,87 @@
-# gb-crypto-local — BitBull, the crypto vertical, running locally end to end
+# BitBull — a working prediction-market exchange for 5-minute BTC options
 
-A working prediction-market exchange for **5-minute BTC binary options**
-("Will BTC be ≥ $X at time T?"), driving GameBull's **real, unmodified** Predictor
-services against a local Docker stack. **Nothing is pushed; no GameBull repo is
-modified** — every integration is through their existing interfaces, exactly as an
-external client would.
+**"Will BTC be ≥ $63,550 at 07:52 UTC?"** — a market that opens, takes real
+orders from real people, and settles five minutes later. The house quotes both
+sides, so it is the counterparty to everything: it carries genuine directional
+inventory risk, and every hard problem in this repo follows from that one fact.
 
-The house is the market maker, so the platform carries real directional inventory
-risk. That single fact drives most of what is in here.
+This runs the platform's **real, unmodified production services** — order
+validation, matching, settlement and payout are all production code — against a
+local Docker stack. The market maker, the pricing curve, the risk instrumentation
+and the hedging integration are what I built around them.
 
-> **Full system record:** `docs/BitBull-System-Architecture.pdf` (~47pp) — architecture,
-> pricing mathematics, the gamma wall, hedging, negative results, and the complete
-> engineering history with root causes. Start there if you are new.
+<p align="center">
+  <img src="docs/images/demo.gif" alt="BitBull's live markets view: a 5-minute BTC binary with YES/NO quotes updating as the house market maker requotes off the Binance spot feed" width="100%">
+</p>
+
+<p align="center"><em>A live 5-minute market. The house requotes continuously off the Binance feed; the countdown ends in settlement and a fresh market opens.</em></p>
 
 ---
 
-## What runs
+## The problem this is really about
+
+An order-book exchange matches buyers to sellers and takes a fee. It has no
+position. **A prediction market with a house maker is not that** — when the crowd
+buys YES, the house is short YES, and it now owns a directional bet on Bitcoin it
+never wanted.
+
+Three things follow, and they're what the repo is actually for:
+
+1. **Pricing.** What is a 5-minute binary worth, and does Black-Scholes describe
+   a market where τ is measured in seconds?
+2. **Quoting.** How wide, and how asymmetric, given the inventory you're already
+   holding?
+3. **Hedging.** Can that inventory risk be neutralised on perps — and does the
+   hedge cost less than the risk it removes?
+
+---
+
+## The MM desk
+
+<img src="docs/images/03-hedge-desk.png" alt="Hedge Desk: net MM P&L $746.89, realized spread $44.09, settlement P&L $702.80, quoted spread $54.78, 1826 contracts, adverse selection -3.77 cents, spread capture efficiency 81%" width="100%">
+
+The operator's view of the house book, decomposed so the P&L is attributable
+rather than a single number:
+
+| Metric | Why it's there |
+|---|---|
+| **Realized spread** vs **quoted spread** | what the vig *theoretically* earns ($54.78) against what actually stuck ($44.09) — the gap is adverse selection |
+| **Adverse selection (¢)** | −3.77¢: how much the fills moved against the house right after trading |
+| **Spread capture efficiency** | 81% — the single number for "is the quoting working" |
+| **Inventory / hedge / settlement P&L** | split out, because a profitable book with a losing hedge is a different problem from the reverse |
+
+Splitting realized from quoted spread is the point. A maker that looks profitable
+on quoted spread can be losing steadily to informed flow, and only the difference
+between those two numbers shows it.
+
+## Liquidity instrumentation, built after an incident
+
+<img src="docs/images/04-liquidity-watch.png" alt="Liquidity Watch: live watcher status, zero sides currently empty, and a table of recent resolved liquidity gaps mostly 0.4-0.8s with one 24.9s outlier" width="100%">
+
+A market with no resting quote on one side is invisible in aggregate P&L and
+obvious to a user who wants to trade. After a production incident where markets
+went one-sided, this watcher polls every 400 ms and records **every gap**: which
+market, which side, how long, and how much time was left when it started.
+
+The tail is the interesting part. Typical gaps are **0.4–0.8s** — a requote
+round-trip, unavoidable. The **24.9s** outlier is a real failure, and having it
+recorded with `t at start` is what makes it diagnosable rather than folklore.
+It also appears as a live tab in the app, so it's operational, not just a log.
+
+## The rest of the app
+
+<p align="center">
+  <img src="docs/images/01-markets.png" alt="Markets view listing the live 5-minute BTC market with YES and NO prices" width="49%">
+  <img src="docs/images/02-portfolio.png" alt="Portfolio view showing positions and wallet" width="49%">
+</p>
+
+Multi-user: everyone gets a name and $1,000, trades against the house maker and
+each other, and settles on the same clock. It was built to be used by a room full
+of people at once, which is a much better test of a matching path than a script.
+
+---
+
+## How it fits together
 
 ```
   BitBull web app  (:5050)   Markets · Portfolio · Hedge Desk · Liquidity Watch
@@ -23,7 +89,7 @@ risk. That single fact drives most of what is in here.
   app/server.mjs             order entry · portfolio · settlement · P&L
         │  place bid
         ▼
-  trading-api :8080  ──►  DynamoDB bb_pending_bids     [GameBull, unmodified]
+  trading-api :8080  ──►  DynamoDB bb_pending_bids            [production, unmodified]
         │                       ▲
         │ SQS                   │ matchedBidsCount
         ▼                       │
@@ -37,118 +103,65 @@ risk. That single fact drives most of what is in here.
                                                               └──►  Binance demo
 ```
 
-The **only** substituted component on the order path is `sqs-bridge`, because
-their service derives its request host from the queue URL (see the three seams
-below). Order validation, matching, settlement and payout are all their code.
+The **only** substituted component on the order path is `sqs-bridge`, because the
+production service derives its request host from the queue URL. Everything that
+validates, matches, settles or pays out is production code — which is the whole
+point: results measured here mean something for the real system.
 
-### Drivers
+### What I built
 
 | Driver | Role |
 |---|---|
-| `mmp-pricing` | The house market maker. Persistent worker; event-driven requoting. |
-| `market-generator` | Rolling ATM markets; tenor via `TENOR_MIN` (5m / 15m / 1h). |
-| `oracle-feed` | Binance WS → Redis spot, **plus an unthrottled tick pub/sub channel**. |
-| `sqs-bridge` | Drains SQS into the real matching engine. |
-| `inventory-mirror` | House net inventory → the Redis keys the hedging sidecar reads. |
-| `liquidity-watcher` | 400 ms diagnostic; also surfaces as a live app tab. |
-| `wallet-stub` | The one component still stubbed. Accounting is genuine. |
-| `secrets-stub` | AWS Secrets Manager stand-in; resolves a port/URL self-collision. |
+| `mmp-pricing` | the house market maker — persistent worker, event-driven requoting |
+| `market-generator` | rolling ATM markets; tenor via `TENOR_MIN` (5m / 15m / 1h) |
+| `oracle-feed` | Binance WS → Redis spot, plus an unthrottled tick pub/sub channel |
+| `inventory-mirror` | house net inventory → the Redis keys the hedging sidecar reads |
+| `liquidity-watcher` | the 400 ms diagnostic above |
+| `sqs-bridge` · `wallet-stub` · `secrets-stub` | the three substituted seams |
 
-### Shared libraries (`drivers/lib/`)
-
-`pricing.mjs` (fair value) · `quoting.mjs` (Stoikov + gamma/inventory/flow widening) ·
-`risk.mjs` (limits, sizing) · `matching.mjs` (book walking) · `fees.mjs` · `flow.mjs`
+Shared libraries in `drivers/lib/`: `pricing.mjs` (fair value) ·
+`quoting.mjs` (Stoikov + gamma/inventory/flow widening) · `risk.mjs` ·
+`matching.mjs` · `fees.mjs` · `flow.mjs`
 
 ---
 
 ## Running it
 
+Needs Docker.
+
 ```bash
 docker compose up -d                 # redis · mysql8 · dynamodb-local · elasticmq · postgres
 node setup/create-schema.mjs         # idempotent bootstrap
 node app/server.mjs                  # :5050 — also spawns the persistent quoter
+```
 
+```bash
 node drivers/oracle-feed/index.mjs           # spot feed (required)
 node drivers/sqs-bridge/index.mjs            # order ingress
 node drivers/inventory-mirror/index.mjs --watch
 node drivers/liquidity-watcher/index.mjs     # optional diagnostics
-
-cd ~/gb-crypto-hedging-service && npm start  # :8790, DRY_RUN by default
 ```
 
-> **Do not use `docker compose down` casually.** MySQL, Postgres and DynamoDB have
-> **no named volumes** — only a bind-mounted init-script directory. `down` + `up`
-> destroys all users, markets and history. To change Docker resources use Docker
-> Desktop's Settings → Resources, which is a VM-level restart and preserves
-> containers. DynamoDB is additionally in-memory: it loses its tables on a VM
-> restart, so re-run `setup/create-schema.mjs` afterwards (idempotent, does not
-> touch MySQL data).
+The hedging sidecar is a separate service — see
+**[Hedging](https://github.com/sidjainnn/Hedging)**, which reads this stack's
+inventory read-only and neutralises it on Binance perps.
 
----
+## Deeper reading
 
-## The three integration seams
-
-Solved entirely from outside their code:
-
-1. **Auth** — `SKIP_MMP_AUTH=1` reduces the check to an API-key header; no IP
-   allowlist, no JWT.
-2. **SQS** — aws-sdk **v2 derives the request host from `params.QueueUrl`** and
-   ignores the configured client endpoint, so their service kept calling real AWS
-   and 403ing. A preload shim rewrites `QueueUrl` to localhost. Subtlety: v2
-   attaches operations **lazily**, so prototype methods are undefined at preload
-   time — each SQS **instance's** methods must be wrapped.
-3. **Market shape** — their controller reads market records from **DynamoDB**, not
-   MySQL, and destructures nested fields that crash if absent.
-
----
-
-## Key documents
-
-| Doc | What it covers |
+| Doc | What's in it |
 |---|---|
-| `docs/BitBull-System-Architecture.pdf` | **The full record.** Start here. |
-| `docs/pricing-and-quoting.md` | Three price layers, marking conventions, quoting cadence, open pricing issues |
-| `drivers/lib/EMPIRICAL_VALIDATION.md` | Why Black-Scholes was replaced, provenance, the implied-σ test |
-| `docs/gamma-hedging-plan.md` | Cross-market hedging (NO-GO) and the options overlay |
-| `contracts.md` | Exact data shapes their services expect |
+| **[`docs/BitBull-System-Architecture.pdf`](docs/BitBull-System-Architecture.pdf)** | the full ~47pp record: architecture, pricing maths, the gamma wall, hedging, negative results, and the engineering history with root causes |
+| [`docs/pricing-and-quoting.md`](docs/pricing-and-quoting.md) | the empirical curve and the quoting overlay |
+| [`docs/gamma-hedging-plan.md`](docs/gamma-hedging-plan.md) | what a linear perp can and cannot hedge near expiry |
+| [`contracts.md`](contracts.md) | the integration seams and their contracts |
 
----
+### Related
 
-## Things that will bite you
+| Repo | What it is |
+|---|---|
+| [Hedging](https://github.com/sidjainnn/Hedging) | the read-only perp-hedging sidecar this stack feeds |
+| [Kronos-Price-Discovery](https://github.com/sidjainnn/Kronos-Price-Discovery) | can a learned model beat the pricing curve running here? |
+| [AMM_Hedging](https://github.com/sidjainnn/AMM_Hedging) | the research simulator where the hedging results were derived |
 
-* **Fair value ≠ market price ≠ tradeable price.** Three distinct layers; never
-  show `fairYes` as a price a user can transact at. See `docs/pricing-and-quoting.md`.
-* **Wallet units are POINTS, not dollars** (100 points = $1). Passing a dollar
-  figure to the wallet credits 100× too little.
-* **The hedge sign mapping is `qYes = houseNo, qNo = houseYes`.** Getting it
-  backwards does not fail loudly — it silently **doubles** risk.
-* **DynamoDB `Scan` caps at 1MB.** An unpaginated scan silently returns only the
-  first page. This caused positions to vanish from portfolios and would have left
-  winners unpaid. Use `scanAll()`.
-* **Requoting is make-before-break.** Post the new ladder, *then* delete the
-  snapshotted old rows. A naive "cancel all my resting rows" after posting deletes
-  the ladder you just posted.
-* **The matching engine truncates floats** (`parseInt(bidAmount * 100)`). At a 1¢
-  tick, 573 of 9,999 two-decimal values silently corrupt. 0.1¢ / 0.25¢ / 0.5¢ are
-  clean; **0.01¢ is not** — hence the 0.1¢ tick.
-
----
-
-## Current state
-
-Working end to end: real user orders route through their trading-api → SQS →
-matching engine → distribution engine, with live BTC pricing, house market making,
-delta hedging, and settlement.
-
-**Known open items** (all detailed in the PDF):
-
-* **Fee revenue is structurally $0** — market-only mode means every fill is
-  house-vs-user, so there is no user-to-user trade to charge on.
-* **Hedge budget vs gamma:** inventory limit 12,500 contracts against a $10k hedge
-  budget, when worst-case ATM notional near expiry is ~$16M.
-* **Price impact is too weak to manage inventory** — a maxed-out position moves
-  the mid only 0.35¢.
-* **Mid-range pricing miscalibration**, whose root cause is that √τ does not
-  collapse the probability curve across τ. Needs multi-day data, not a code fix.
-* **Selling is not implemented** — positions are hold-to-settlement. When it ships,
-  portfolio marking must move from mid to **bid**.
+No real money anywhere: the exchange is local and play-money, and the hedge runs
+against the Binance **demo** venue.

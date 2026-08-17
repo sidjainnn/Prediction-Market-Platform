@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BitBull — a prediction-market exchange for 5-minute BTC options</title>
+<meta name="description" content="A working prediction-market exchange for 5-minute BTC binary options: house market making, an empirically-calibrated pricing curve, liquidity instrumentation and perp hedging.">
+<style>
+  :root{
+    --bg:#fcfcfb; --panel:#fff; --ink:#15181d; --muted:#5f6772; --line:#e6e6e4;
+    --accent:#2a78d6; --warm:#eb6834; --good:#1baf7a; --code:#f4f5f7;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0e1116; --panel:#151a21; --ink:#e8eaed; --muted:#98a1ad; --line:#242b34;
+           --accent:#3987e5; --warm:#d95926; --good:#199e70; --code:#11151b; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:960px;margin:0 auto;padding:0 24px}
+  header{padding:72px 0 40px;border-bottom:1px solid var(--line)}
+  h1{font-size:clamp(30px,5vw,44px);line-height:1.15;margin:0 0 16px;letter-spacing:-.02em}
+  .lede{font-size:clamp(17px,2.2vw,20px);color:var(--muted);margin:0 0 24px;max-width:64ch}
+  .tags{display:flex;flex-wrap:wrap;gap:8px;margin-top:24px}
+  .tag{font-size:12.5px;padding:5px 11px;border:1px solid var(--line);border-radius:999px;color:var(--muted)}
+  section{padding:52px 0;border-bottom:1px solid var(--line)}
+  h2{font-size:26px;margin:0 0 8px;letter-spacing:-.01em}
+  h3{font-size:17px;margin:32px 0 8px}
+  .sub{color:var(--muted);margin:0 0 24px;max-width:70ch}
+  p{max-width:70ch}
+  figure{margin:24px 0}
+  img{max-width:100%;height:auto;display:block;border:1px solid var(--line);border-radius:10px}
+  figcaption{color:var(--muted);font-size:14px;margin-top:10px;max-width:70ch}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin:24px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+  .card .k{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+  .card .v{font-size:24px;font-weight:650;margin:4px 0 2px}
+  .card .d{font-size:13.5px;color:var(--muted)}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:16px;
+      overflow-x:auto;font-size:13px;line-height:1.55}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  table{border-collapse:collapse;width:100%;margin:20px 0;font-size:15px;display:block;overflow-x:auto}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.05em}
+  a{color:var(--accent)}
+  .note{border-left:3px solid var(--warm);padding:2px 0 2px 16px;color:var(--muted);margin:24px 0;max-width:70ch}
+  footer{padding:44px 0 72px;color:var(--muted);font-size:14px}
+</style>
+</head>
+<body>
+
+<header><div class="wrap">
+  <h1>A prediction-market exchange for 5-minute BTC options</h1>
+  <p class="lede">“Will BTC be ≥ $63,550 at 07:52 UTC?” — a market that opens, takes
+  real orders, and settles five minutes later. The house quotes both sides, so it is
+  the counterparty to everything, and carries genuine directional inventory risk.</p>
+  <div class="tags">
+    <span class="tag">house market making</span>
+    <span class="tag">empirical pricing curve</span>
+    <span class="tag">Avellaneda–Stoikov quoting</span>
+    <span class="tag">perp delta hedging</span>
+    <span class="tag">live Binance feed</span>
+    <span class="tag">Node · Redis · MySQL · DynamoDB · SQS</span>
+  </div>
+</div></header>
+
+<section><div class="wrap">
+  <h2>The system, running</h2>
+  <p class="sub">Real users, real matching, real settlement — against production
+  order-validation, matching and payout services on a local Docker stack.</p>
+  <figure>
+    <img src="images/demo.gif" alt="BitBull live markets view with YES and NO quotes updating as the house market maker requotes off the Binance spot feed">
+    <figcaption>The house requotes continuously off the Binance feed. The countdown ends
+    in settlement and a fresh at-the-money market opens.</figcaption>
+  </figure>
+</div></section>
+
+<section><div class="wrap">
+  <h2>Why this is hard</h2>
+  <p>An order-book exchange matches buyers to sellers and takes a fee — it holds no
+  position. A prediction market with a house maker is a different animal: when the
+  crowd buys YES, the house is short YES, and it owns a directional bet on Bitcoin it
+  never chose.</p>
+  <div class="grid">
+    <div class="card"><div class="k">Pricing</div><div class="v">τ in seconds</div>
+      <div class="d">Does Black–Scholes describe a binary five minutes from expiry? An empirically-calibrated curve replaced it.</div></div>
+    <div class="card"><div class="k">Quoting</div><div class="v">Inventory-aware</div>
+      <div class="d">How wide, and how asymmetric, given what you already hold — Stoikov plus gamma, inventory and flow widening.</div></div>
+    <div class="card"><div class="k">Hedging</div><div class="v">Delta, not gamma</div>
+      <div class="d">A linear perp cannot hedge a digital's terminal gamma. It can hedge delta, and that pays.</div></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <h2>The market-maker desk</h2>
+  <p class="sub">The operator's view, decomposed so P&amp;L is attributable rather than a single number.</p>
+  <figure>
+    <img src="images/03-hedge-desk.png" alt="Hedge Desk showing net MM P&L, realized versus quoted spread, adverse selection and spread capture efficiency">
+    <figcaption>Realized spread ($44.09) against quoted spread ($54.78) — the gap is
+    adverse selection, here −3.77¢, giving 81% spread-capture efficiency.</figcaption>
+  </figure>
+  <p>Splitting realized from quoted spread is the point. A maker that looks profitable
+  on quoted spread can be losing steadily to informed flow, and only the difference
+  between those two numbers reveals it.</p>
+</div></section>
+
+<section><div class="wrap">
+  <h2>Instrumentation, built after an incident</h2>
+  <p class="sub">A market with no resting quote on one side is invisible in aggregate
+  P&amp;L and immediately obvious to a user trying to trade.</p>
+  <figure>
+    <img src="images/04-liquidity-watch.png" alt="Liquidity Watch listing resolved liquidity gaps with duration and time remaining at start">
+    <figcaption>A 400 ms watcher records every gap: which market, which side, how long,
+    and how much time was left when it began.</figcaption>
+  </figure>
+  <p>The tail is what matters. Typical gaps are <strong>0.4–0.8s</strong> — one requote
+  round-trip, unavoidable. The <strong>24.9s</strong> outlier is a real failure, and
+  recording it with time-to-expiry is what makes it diagnosable rather than folklore.</p>
+</div></section>
+
+<section><div class="wrap">
+  <h2>Architecture</h2>
+  <pre><code>  BitBull web app  (:5050)   Markets · Portfolio · Hedge Desk · Liquidity Watch
+        │
+  app/server.mjs             order entry · portfolio · settlement · P&amp;L
+        │  place bid
+        ▼
+  trading-api :8080  ──►  DynamoDB bb_pending_bids            [production, unmodified]
+        │                       ▲
+        │ SQS                   │ matchedBidsCount
+        ▼                       │
+  sqs-bridge  ──►  matching-engine :7001  ──►  MySQL order books   [unmodified]
+                                              Redis LMSR state
+        │ at expiry
+        ▼
+  distribution-engine :3010  ──►  wallet-stub :3000  ──►  bb_users   [unmodified]
+
+  inventory-mirror  ──►  Redis MMP_LMSR_QUANTITY_*  ──►  hedging-service :8790
+                                                              └──►  Binance demo</code></pre>
+  <p>The only substituted component on the order path is <code>sqs-bridge</code>.
+  Everything that validates, matches, settles or pays out is production code — which
+  is the point: results measured here mean something for the real system.</p>
+</div></section>
+
+<section><div class="wrap">
+  <h2>Run it yourself</h2>
+  <p class="sub">This page is a walkthrough, not a live deployment — the exchange is five
+  services plus Docker, so it runs locally rather than on static hosting.</p>
+  <pre><code>docker compose up -d              # redis · mysql8 · dynamodb-local · elasticmq · postgres
+node setup/create-schema.mjs      # idempotent bootstrap
+node app/server.mjs               # :5050 — also spawns the persistent quoter
+node drivers/oracle-feed/index.mjs</code></pre>
+  <div class="note">No real money anywhere. The exchange is local and play-money; the
+  hedge runs against the Binance <strong>demo</strong> venue, with mainnet hosts blocked in code.</div>
+</div></section>
+
+<section><div class="wrap">
+  <h2>Related work</h2>
+  <table>
+    <tr><th>Repo</th><th>What it is</th></tr>
+    <tr><td><a href="https://github.com/sidjainnn/Prediction-Market-Platform">Prediction-Market-Platform</a></td><td>this exchange — source, drivers and the ~47pp architecture record</td></tr>
+    <tr><td><a href="https://github.com/sidjainnn/Hedging">Hedging</a></td><td>the read-only perp sidecar that neutralises the house's inventory</td></tr>
+    <tr><td><a href="https://github.com/sidjainnn/Kronos-Price-Discovery">Kronos-Price-Discovery</a></td><td>can a fine-tuned foundation model beat the pricing curve?</td></tr>
+    <tr><td><a href="https://github.com/sidjainnn/AMM_Hedging">AMM_Hedging</a></td><td>the research simulator where the hedging results were derived</td></tr>
+  </table>
+</div></section>
+
+<footer><div class="wrap">
+  Built by <a href="https://github.com/sidjainnn">Sidharth Jain</a>.
+  Screenshots are of the system running against the live Binance feed.
+</div></footer>
+
+</body>
+</html>

@@ -25,3 +25,6 @@ localstack/volume/
 # Point-in-time snapshots remain in history (commits c7e814c..c8a1914).
 data/liquidity-watch.csv
 research/kalshi_15m.csv
+
+# copied from docs/images at build time by the Pages workflow
+site/images/
