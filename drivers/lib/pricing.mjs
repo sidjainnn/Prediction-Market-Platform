@@ -112,9 +112,13 @@ export function bidId(prefix) {
 // enrich matched bids (totalBidCount, clientId…). Keyed marketId=`${mkt}.${uid}`.
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { REGION, DDB_ENDPOINT, AWS_CREDS } from '../../setup/local.mjs';
+// Endpoint/region come from setup/local.mjs, which honours env overrides. This
+// used to hardcode http://localhost:8000: fine on the host, fatal in a container,
+// where localhost is the container itself — every writePendingBid threw
+// ECONNREFUSED and the caller reported it only as a bare "Error".
 const _ddb = DynamoDBDocumentClient.from(new DynamoDBClient({
-  region: 'ap-south-1', endpoint: 'http://localhost:8000',
-  credentials: { accessKeyId: 'local', secretAccessKey: 'local' },
+  region: REGION, endpoint: DDB_ENDPOINT, credentials: AWS_CREDS,
 }));
 export async function writePendingBid(bid) {
   const qty = bid.currentBidCount ?? bid.bidCount ?? 0;
