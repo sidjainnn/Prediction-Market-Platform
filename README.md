@@ -167,9 +167,37 @@ services on the order path. They live in their own repositories:
 | wallet | 3000 | balances (a stub lives here; accounting is genuine) |
 
 Start those, point `run/services.env` at them, and the stack runs end to end.
-Without them the app boots and quotes, but nothing matches — that seam is the
-whole reason this repo exists, and vendoring their source into it would defeat
-the point of testing against unmodified production code.
+
+### …or run it standalone
+
+`standalone/services.mjs` reimplements that order path from `contracts.md` — the
+data shapes this repo already documents — reusing `drivers/lib`. It makes the
+stack **self-contained**: no external services, nothing to obtain.
+
+```bash
+node standalone/services.mjs     # :8080 trading-api · :7001 matcher · :7002 distribution
+```
+
+Three endpoints is the entire surface: `POST /skillPolls/placeBid`,
+`POST /handle`, `POST /market-status-change`.
+
+| Behaviour | Verified |
+|---|---|
+| bid validation (`INVALID_BID_INFO`, price range, market open) | ✅ |
+| complementary-price crossing — YES@60 fills against NO@40, YES@55 does not | ✅ |
+| price-time priority `bid_amount DESC, row_id` (via `drivers/lib/matching.mjs`) | ✅ |
+| partial fills and resting remainder (10 offered, 6 taken, 4 left) | ✅ |
+| settlement credits winners, including takers who never rested | ✅ |
+
+Settlement reads a **fills ledger**, not the order book: a fully-matched
+aggressive bid never becomes a resting row, so a book-only payout query pays no
+taker at all. That bug was caught by the test above and is why
+`standalone_fills` exists.
+
+**Out of scope** until needed: cancels, sells, buyback credit, ladder markets,
+and partial-cancel accounting. This covers place → match → rest → settle → pay,
+which is what the app exercises. It is a reimplementation from documented
+contracts, not a copy of any production service.
 
 ## Deeper reading
 
