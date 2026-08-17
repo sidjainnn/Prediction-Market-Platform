@@ -1,0 +1,45 @@
+# Full-fidelity local stack for the GameBull crypto vertical.
+# Stands up the four datastores the Predictor exchange uses, so their UNMODIFIED
+# services (trading-api, predictor-matching-engine, distribution-engine) can run
+# locally and our driver services can create/price/settle crypto markets against
+# them — nothing pushed, no Bitbucket changes.
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  mysql:
+    image: mysql:8.0
+    # legacy `mysql` npm client (in their services) needs native_password auth.
+    # NOTE: `--mysql-native-password=ON` is a MySQL 8.4+ flag (there the plugin
+    # ships disabled). On 8.0.x the plugin is built in and that flag is an
+    # *unknown variable* → mysqld aborts at startup. The `mysql:8.0` tag now
+    # resolves to 8.0.46, so pass only the 8.0-valid flag.
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: local
+      MYSQL_DATABASE: predictor
+    ports: ["3306:3306"]
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d   # schema + seed run on first boot
+
+  # wallet store for the distribution engine (walletPgPlugin uses Postgres)
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: "12345678"
+      POSTGRES_USER: root
+      POSTGRES_DB: user
+    ports: ["5432:5432"]
+
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    command: "-jar DynamoDBLocal.jar -sharedDb -inMemory"
+    ports: ["8000:8000"]
+
+  # SQS-compatible queue for the matching-engine trigger
+  sqs:
+    image: softwaremill/elasticmq-native:latest
+    ports: ["9324:9324", "9325:9325"]
+    volumes:
+      - ./localstack/elasticmq.conf:/opt/elasticmq.conf

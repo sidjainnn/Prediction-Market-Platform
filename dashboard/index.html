@@ -1,0 +1,95 @@
+<!doctype html><html><head><meta charset="utf8"><title>GameBull Crypto — Local Exchange</title>
+<style>
+  body{font-family:ui-sans-serif,system-ui,sans-serif;background:#0e1117;color:#e6e9ef;margin:0;padding:20px}
+  h1{font-size:18px;margin:0 0 2px} .sub{color:#8a93a6;font-size:12px;margin-bottom:16px}
+  .row{display:flex;gap:16px;flex-wrap:wrap} .card{background:#151a24;border:1px solid #2a3140;border-radius:10px;padding:14px;flex:1;min-width:260px}
+  .k{color:#8a93a6;font-size:11px} .big{font-size:22px;font-variant-numeric:tabular-nums}
+  table{width:100%;border-collapse:collapse;font-size:12px} td,th{padding:4px 6px;text-align:left;border-bottom:1px solid #222a38}
+  .house{color:#e0a030} .user{color:#7db1ff} .yes{color:#4ade80} .no{color:#f87171}
+  button{background:#1b2130;color:#e6e9ef;border:1px solid #2a3140;border-radius:7px;padding:7px 12px;cursor:pointer;font-size:13px;margin:2px}
+  button:hover{border-color:#3b82f6} button.primary{background:#1e3a5f;border-color:#3b82f6}
+  .log{font-family:ui-monospace,monospace;font-size:11px;color:#9aa4b5;max-height:180px;overflow:auto;line-height:1.6}
+  .pill{display:inline-block;background:#1b2130;border-radius:6px;padding:2px 8px;font-size:11px}
+  .matched{opacity:.5;text-decoration:line-through}
+</style></head><body>
+<h1>GameBull Crypto — Local Exchange <span class="pill" id="conn">live</span></h1>
+<div class="sub">Their real matching + distribution engines, driven locally · market → house liquidity → match → oracle settle → payout</div>
+
+<div class="row" style="margin-bottom:16px">
+  <button class="primary" onclick="act('new-market')">➊ New 5m BTC market</button>
+  <button onclick="act('quote')">➋ House quotes liquidity</button>
+  <button onclick="act('buy','side=YES&price=55&qty=50')">➌ User buys YES ×50</button>
+  <button onclick="act('buy','side=NO&price=55&qty=50')">User buys NO ×50</button>
+  <button class="primary" onclick="act('settle')">➍ Settle + pay out</button>
+</div>
+
+<div class="row">
+  <div class="card" style="flex:2">
+    <div class="k">BTC oracle</div><div class="big" id="spot">–</div>
+    <div style="margin-top:10px" id="market"></div>
+  </div>
+  <div class="card"><div class="k">wallet balances</div><table id="bal"></table></div>
+  <div class="card" style="flex:1.4"><div class="k">🛡 house inventory & hedge <span class="pill" id="hsvc">service ?</span></div><div id="hedge" style="margin-top:6px"></div></div>
+</div>
+
+<div class="row" style="margin-top:16px">
+  <div class="card"><div class="k" style="margin-bottom:6px">order book · <span class="yes">YES</span></div><table id="bookYes"></table></div>
+  <div class="card"><div class="k" style="margin-bottom:6px">order book · <span class="no">NO</span></div><table id="bookNo"></table></div>
+</div>
+
+<div class="row" style="margin-top:16px">
+  <div class="card"><div class="k" style="margin-bottom:6px">settled markets</div><table id="settled"></table></div>
+  <div class="card"><div class="k" style="margin-bottom:6px">activity</div><div class="log" id="log"></div></div>
+</div>
+
+<script>
+// absolute base so the page works whether opened from the server, a file, or the preview panel
+const BASE = (location.origin && location.origin.startsWith('http')) ? location.origin : 'http://localhost:4000';
+async function act(name, qs){ document.getElementById('conn').textContent='working…'; await fetch(BASE+'/api/'+name+(qs?'?'+qs:''),{method:'POST'}); document.getElementById('conn').textContent='live'; refresh(); }
+function bookRows(rows){ return (rows||[]).map(r=>`<tr class="${r.is_matched? 'matched':''}"><td class="${r.who==='HOUSE'?'house':'user'}">${r.who}</td><td>${Number(r.price).toFixed(2)}¢</td><td>${r.qty}</td></tr>`).join('')||'<tr><td class="k">empty</td></tr>'; }
+async function refresh(){
+  try{
+    const s=await (await fetch(BASE+'/api/state')).json();
+    document.getElementById('spot').textContent = s.spot? '$'+s.spot.toFixed(1):'–';
+    const m=s.active;
+    document.getElementById('market').innerHTML = m
+      ? `<div class="k">active market</div><div style="font-size:15px;margin:2px 0">${m.question?.en||m.marketId}</div>
+         <span class="pill">strike $${m._meta?.strike??'?'}</span>
+         <span class="pill">expires ${m._meta? new Date(m._meta.expiryTs).toISOString().slice(11,19):'?'}</span>
+         <span class="pill">status ${m.marketStatus}</span>`
+      : '<div class="k">no active market — click ➊</div>';
+    document.getElementById('bookYes').innerHTML='<tr><th>who</th><th>price</th><th>qty</th></tr>'+bookRows(s.book?.yes);
+    document.getElementById('bookNo').innerHTML='<tr><th>who</th><th>price</th><th>qty</th></tr>'+bookRows(s.book?.no);
+    document.getElementById('bal').innerHTML='<tr><th>user</th><th>balance</th></tr>'+(s.balances||[]).map(b=>`<tr><td>${Number(b.user_id)===s.mmpUser?'HOUSE':'user '+b.user_id}</td><td>$${Number(b.unused_amount).toFixed(2)}</td></tr>`).join('');
+    document.getElementById('settled').innerHTML='<tr><th>market</th><th>outcome</th><th>settled@</th></tr>'+(s.settled||[]).map(x=>`<tr><td>${x.q||x.marketId}</td><td class="${x.answer==='YES'?'yes':'no'}">${x.answer}</td><td>$${x.settledValue?Number(x.settledValue).toFixed(0):'?'}</td></tr>`).join('')||'<tr><td class="k">none yet</td></tr>';
+    const h=s.hedge||{};
+    const pm=(h.perMarket||[]).filter(x=>x.shortYes!==0).map(x=>`<tr><td>K $${x.strike}</td><td class="${x.shortYes>0?'no':'yes'}">${x.shortYes>0?'short YES':'short NO'} ${Math.abs(x.shortYes)}</td><td>δ ${x.delta.toFixed(4)}</td></tr>`).join('');
+    // Prefer the real hedging service (source of truth); fall back to the inline estimate.
+    const hs=s.hedgeService;
+    const svcPill=document.getElementById('hsvc');
+    if(hs){
+      svcPill.textContent='service '+hs.venue+(hs.enabled?'':' · off');
+      svcPill.style.background=hs.armed?'#1e3a5f':'#1b2130';
+      const side=hs.position>0?'LONG':(hs.position<0?'SHORT':'FLAT');
+      document.getElementById('hedge').innerHTML=`
+        <div style="font-size:20px;margin:2px 0">hedge: <span class="${side==='LONG'?'yes':(side==='SHORT'?'no':'')}">${side} ${Math.abs(hs.position).toFixed(4)} BTC</span>
+          <span class="pill" style="font-size:10px">${hs.armed?'armed':(hs.idleReason||'idle')}</span></div>
+        <div class="k">aggregate δ ${hs.aggregateDelta.toFixed(4)} · exposure $${hs.notionalUsdt.toFixed(0)} · gate $${hs.effectiveGate.toFixed(0)}</div>
+        <div class="k">hedge P&L $${hs.hedgePnl.toFixed(2)} · fees $${hs.fees.toFixed(2)}</div>
+        <table style="margin-top:8px"><tr><th>market</th><th>house exposure</th><th></th></tr>${pm}</table>
+        <div class="k" style="margin-top:6px">live from gb-crypto-hedging-service · reads MMP_LMSR_* inventory → perp hedge</div>`;
+    } else {
+      svcPill.textContent='service down';
+      svcPill.style.background='#3a1e1e';
+      document.getElementById('hedge').innerHTML = h.hedge
+        ? `<div style="font-size:20px;margin:2px 0">hedge (estimate): <span class="${h.hedge.side==='LONG'?'yes':'no'}">${h.hedge.side} ${h.hedge.btc.toFixed(4)} BTC</span></div>
+           <div class="k">notional $${h.notionalUsdt.toFixed(0)} · aggregate δ ${h.aggregateDelta.toFixed(4)}</div>
+           <table style="margin-top:8px"><tr><th>market</th><th>house exposure</th><th></th></tr>${pm}</table>
+           <div class="k" style="margin-top:6px">inline estimate — start the hedging service for the live position</div>`
+        : `<div class="k">no house inventory yet — match a trade to build skew</div>`;
+    }
+    document.getElementById('log').innerHTML=(s.log||[]).join('<br>');
+  }catch(e){ document.getElementById('conn').textContent='backend down'; }
+}
+refresh(); setInterval(refresh,1500);
+</script></body></html>

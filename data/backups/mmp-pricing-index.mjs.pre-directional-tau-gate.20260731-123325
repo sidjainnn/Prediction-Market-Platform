@@ -1,0 +1,505 @@
+// MMP pricing — the house provides liquidity by quoting BOTH sides of every
+// active crypto market into the CLOB. For each market it CANCELS its own
+// still-resting (unmatched) quotes, then reads spot + meta + inventory +
+// order flow, computes an inventory-aware reservation price and dynamic
+// spread (drivers/lib/quoting.mjs — the only place inventory adjusts price),
+// applies a progressive size taper as exposure approaches the limit
+// (drivers/lib/risk.mjs), and posts fresh house YES/NO bids to the matcher's
+// /handle. Unmatched → they rest in the book as liquidity.
+//
+// Cancel-then-requote (not cancel-via-their-engine — we don't have a local
+// cancel-engine wired, see docs/qa-plan.md Stage 1 note): we directly remove the
+// house's own unmatched resting rows from the per-market order-book table before
+// posting new ones, so the book always reflects ONE current house quote per side
+// instead of accumulating stale quotes from every past re-quote cycle.
+//
+//   node drivers/mmp-pricing/index.mjs         # quote all active markets once
+//   node drivers/mmp-pricing/index.mjs <mktId> # quote a single market (event trigger)
+//   LOOP=1 node drivers/mmp-pricing/index.mjs  # re-quote every 5s
+
+import Redis from 'ioredis';
+import mysql from 'mysql2/promise';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
+import { REGION, DDB_ENDPOINT, AWS_CREDS, REDIS, MYSQL, MMP_USER_ID } from '../../setup/local.mjs';
+import { digitalProbYes, empiricalProbYes, digitalDelta, toTick, bidId, placeBid, cancelRestingRows, snapshotRestingRows } from '../lib/pricing.mjs';
+import { dynamicSpread, lmsrStepQty, ammBForTau } from '../lib/quoting.mjs';
+import { orderFlowImbalance } from '../lib/flow.mjs';
+import { withinLimit, quoteSize } from '../lib/risk.mjs';
+
+const MATCHER = process.env.MATCHER_URL || 'http://localhost:7001';
+const SYMBOL = process.env.ORACLE_SYMBOL || 'BTCUSDT';
+const MMP_VERSION = 9999999999999; // always-valid marker (Utilities.isMMPVersionValid)
+const QTY = Number(process.env.MMP_QTY || 100);         // base house quote size (shares)
+const SIGMA_PER_SEC = 0.0004;
+
+// Calibrated so the QUOTED MARKET is 2-5¢ wide (what real prediction markets
+// show), not so the formula's raw output is pinned to the clamp. The dominant
+// Avellaneda-Stoikov depth term is (2/γ)·ln(1+γ/k): at amm-hedging's k=12 that
+// alone is ~16¢, which is why the ported defaults produced a 20¢+ market here.
+// k≈100 puts it at ~2¢, so the total lands ~3-4¢ naturally and the clamp in
+// quoting.mjs stays a guardrail rather than the thing setting the price.
+const GAMMA = Number(process.env.MMP_GAMMA || 1.0);
+const SIGMA_P = Number(process.env.MMP_SIGMA_P || 0.10);
+const K = Number(process.env.MMP_K || 100);
+const GAMMA_WIDEN = Number(process.env.MMP_GAMMA_WIDEN || 0.015);
+
+// ── Depth: an actual AMM decides the size at each price, inside a CLOB ──────
+// amm-hedging is a bonding-curve AMM, so liquidity is unbounded by
+// construction — a large order just walks up the curve. A CLOB has only the
+// size actually resting. We reproduce the curve by posting a LADDER:
+// TICK-stepped levels walking away from the touch, sized by the LMSR cost
+// function's own marginal-price relation (lmsrStepQty, drivers/lib/quoting.mjs)
+// rather than a flat constant — so a big order sweeps into progressively worse
+// prices exactly like AMM slippage, with a shape the AMM itself implies.
+const TICK = Number(process.env.MMP_TICK || 0.1);            // ¢ grid — MUST match market-generator's PRICE_INTERVAL
+// Reach, not density: how far in price the book extends before an order past
+// it just gets "no liquidity." AMM_B_MAX controls how many shares sit at
+// each already-existing rung; this controls how many rungs exist at all —
+// widened 8->12 so a large single sweep still gets filled (at progressively
+// worse prices) instead of hitting a hard wall past the old 8c reach.
+const LADDER_LEVELS = Number(process.env.MMP_LADDER_LEVELS || 12);
+const LADDER_STEP = Number(process.env.MMP_LADDER_STEP || 1); // ¢ between levels
+// AMM decides size, not a flat constant: liquidity parameter for
+// lmsrStepQty() (drivers/lib/quoting.mjs). Distinct from B below (that's the
+// Avellaneda-Stoikov inventory NORMALIZER for reservation-price skew; this is
+// the LMSR DEPTH parameter for how many shares sit at each ladder rung) — same
+// unit (shares) but a different role, so kept as its own knob.
+// b now DECAYS with time-to-expiry (ammBForTau, drivers/lib/quoting.mjs)
+// instead of being a flat constant — see that function's comment for the
+// reasoning. bMax is calibrated so a level right at the touch, ATM, lands
+// ~1000 shares (double the earlier ~500 target) — while levels further from
+// 50% grow convexly (LMSR "gets stickier" in the tails). Note the 8-level
+// cumulative ladder at this b (~8k shares) now exceeds INV_LIMIT (5000), so
+// the risk-gate's remaining-exposure-room cap clips the far rungs (~levels
+// 6-8) rather than their full logit-implied size — raise INV_LIMIT in tandem
+// if the goal is more total resting depth rather than deeper near rungs.
+// bMin is sized off a stated worst-case SETTLEMENT loss tolerance (not the
+// same thing as the BTC-delta hedge notional): loss = b·ln(2), so b=1500 ->
+// ~$1,040 worst-case loss in the final seconds before the expiry lockout —
+// small enough to self-insure from spread/fee revenue without needing the
+// perp hedge to cover it.
+const AMM_B_MAX = Number(process.env.MMP_AMM_B_MAX || process.env.MMP_AMM_B || 25000);
+const AMM_B_MIN = Number(process.env.MMP_AMM_B_MIN || 1500);
+// Per-level cap: LMSR depth grows without bound approaching 0¢/100¢, so a
+// ladder that reaches deep into the tail would otherwise post one absurdly
+// large rung there. This is a backstop, not the sizing mechanism — AMM_B/step
+// spacing set the real shape.
+const LADDER_MAX_QTY = Number(process.env.MMP_LADDER_MAX_QTY || 3000);
+// Legacy flat fallback — used only if a level's AMM-implied size rounds to 0
+// (can happen with a very small AMM_B) so a rung is never silently dropped.
+const LADDER_MIN_QTY = Number(process.env.MMP_LADDER_MIN_QTY || 25);
+const INV_WIDEN = Number(process.env.MMP_INV_WIDEN || 0.02);
+const FLOW_WIDEN = Number(process.env.MMP_FLOW_WIDEN || 0.02);
+// Max one-sided house inventory (shares). Should stay comfortably above the
+// ladder's typical total depth, otherwise the risk gate truncates rungs and
+// the "deep book" collapses back toward a single quote. Raised 5000->12500 to
+// fit the 12-level ladder's full logit-implied depth at AMM_B_MAX (~12,239
+// shares near tau=REF_SEC). The perp hedger is what makes carrying this
+// exposure acceptable — but note gb-crypto-hedging-service's MAX_NOTIONAL_USDT
+// (default 10000) is a separate, unrelated cap on hedge notional; a house
+// position near the new INV_LIMIT, at high delta (close to the strike, low
+// tau), can now imply BTC hedge notional the venue caps below full coverage —
+// re-check that budget if this is raised further.
+const INV_LIMIT = Number(process.env.MMP_INV_LIMIT || 12500);
+// Empirical (Polymarket/Kalshi-calibrated) fair value vs. Black-Scholes — now
+// DEFAULT ON, together with app/server.mjs's matching fairValueYes() (same
+// env var, MUST move together — server.mjs uses it for realized-spread,
+// adverse-selection, inventoryPnl, and the fair-value-movement requote
+// trigger, all of which need to agree with what this file actually quoted
+// off of). Live-validated against real Kalshi BTC 15-min order-book data:
+// avg error 5.0pp vs Black-Scholes' 36pp across 3 readings spanning a full
+// window. Rollback: set MMP_EMPIRICAL_FAIR_VALUE=0 in BOTH processes'
+// environment to revert to Black-Scholes instantly, no code change needed
+// (mmp-pricing picks it up next quote cycle; server.mjs needs a restart).
+const EMPIRICAL_FAIR_VALUE = process.env.MMP_EMPIRICAL_FAIR_VALUE !== '0';
+const REF_SEC_FOR_EMPIRICAL = Number(process.env.MMP_EMPIRICAL_REF_SEC || 300);
+// Dynamic, delta-aware inventory cap (rollback: set MMP_DYNAMIC_INV_CAP=0 to
+// go back to the flat INV_LIMIT above with zero other changes needed).
+//
+// INV_LIMIT alone is one flat share count regardless of how much real hedge
+// notional that inventory implies — but implied notional = shares * dpdS *
+// spot, and dpdS (the digital's delta) spikes near the strike and near
+// expiry (the gamma wall), so the SAME share count can mean wildly different
+// real risk depending on when/where it happens. This computes, each quote
+// cycle, the max shares the CURRENT dpdS would let the hedge budget
+// (HEDGE_MAX_NOTIONAL_USDT — mirror gb-crypto-hedging-service's own
+// MAX_NOTIONAL_USDT here, they're separate processes/configs; keep in sync)
+// actually cover, and takes whichever of that or INV_LIMIT is SMALLER — this
+// can only tighten the existing cap, never loosen it beyond INV_LIMIT.
+// Defaults OFF (opt-in via MMP_DYNAMIC_INV_CAP=1) — live-tested and found to
+// crush normal quoting almost all the time at any believable HEDGE_MAX_NOTIONAL_USDT
+// (see the derivation above), not just the extreme cases it targets. Needs a
+// real fix (see conversation) before defaulting on. Code path is fully wired
+// and ready once that's settled.
+const DYNAMIC_INV_CAP_ENABLED = process.env.MMP_DYNAMIC_INV_CAP === '1';
+const HEDGE_MAX_NOTIONAL_USDT = Number(process.env.MMP_HEDGE_MAX_NOTIONAL_USDT || 10000);
+// Same gamma-wall floor as the hedging service's own minTauSec (config.ts
+// hedgeMinTauSec) — past this point dp/dS is a mathematical fiction, so
+// floor tau for the delta calc rather than let the cap collapse to ~0.
+const MIN_TAU_FOR_DELTA_SEC = Number(process.env.MMP_MIN_TAU_FOR_DELTA || 60);
+const EXPIRY_LOCKOUT_SEC = Number(process.env.MMP_EXPIRY_LOCKOUT || 20);
+// Directional mode triggers off FAIR VALUE itself being extreme, not off a
+// flat |spot-strike| distance gated to only the last EXPIRY_LOCKOUT_SEC.
+// Found live (2026-07-24): fairYes was already 94% at tau=46s (well outside
+// the old tau<=20s gate) and stayed there for 2+ minutes, but the old logic
+// kept normal two-sided ~2c-spread quoting the whole time regardless — the
+// house kept offering the near-certain favorite cheaply for minutes because
+// the trigger only looked at the clock, not at how extreme the odds already
+// were. fairYes already correctly incorporates BOTH distance and time
+// (especially with the empirical curve, live-validated against real
+// exchange data) — a much more principled signal than a raw dollar gap, so
+// the dollar-distance gate is retired in favor of this.
+const DIRECTIONAL_FAIR_VALUE_THRESHOLD = Number(process.env.MMP_DIRECTIONAL_FAIR_VALUE || 0.90);
+// Even priced exactly at fair value, bidding the favored side has EV=0 by
+// construction — pricing "fairly" never itself says when to stop. What
+// actually gets worse as the favored price climbs is risk CONCENTRATION: at
+// price p (cents), the house risks p to win only (100-p) if right — a
+// risk:reward ratio of p/(100-p) that explodes toward infinity as p->100.
+// Cap that ratio at MAX_RISK_REWARD_RATIO (max cents risked per cent of
+// potential gain) instead of picking a price by feel: cap = R*100/(R+1).
+// R=19 -> 95c — above that, stop adding to the favored side (grey it out)
+// and bid the underdog directly instead, at ITS fair price (<=5c here by
+// construction), which is a far better risk:reward trade at that point.
+const MAX_RISK_REWARD_RATIO = Number(process.env.MMP_MAX_RISK_REWARD || 19);
+const AGGRESSIVE_CAP_CENTS = Math.round((MAX_RISK_REWARD_RATIO * 100) / (MAX_RISK_REWARD_RATIO + 1));
+// Narrow, deliberately-scoped exception: loosen the cap ONLY inside the
+// final NEAR_EXPIRY_CAP_SEC seconds of actual expiry — not a general
+// "more time = safer to go extreme" taper (that direction was considered
+// and rejected: more time left means more room for a real reversal, and
+// more exposure to our own model's tail-calibration risk, not less — see
+// conversation). This exception is deliberately narrow for two reasons that
+// both hold ONLY this close to expiry: (1) there's genuinely no time left
+// for a reversal, and (2) it's the ONLY regime our own fair-value curve has
+// actually been checked against real exchange data (every live Kalshi
+// reading captured this session was at low tau on their 15-min market).
+// R=49 -> 98c/2c, a real but modest loosening from the general 95c/5c cap —
+// NOT anywhere close to the 1c/0.1c real platforms use, which relies on
+// cross-participant diversification and competitive correction a single
+// house account here doesn't have.
+const NEAR_EXPIRY_CAP_SEC = Number(process.env.MMP_NEAR_EXPIRY_CAP_SEC || 10);
+const NEAR_EXPIRY_MAX_RISK_REWARD_RATIO = Number(process.env.MMP_NEAR_EXPIRY_MAX_RISK_REWARD || 49);
+const NEAR_EXPIRY_CAP_CENTS = Math.round((NEAR_EXPIRY_MAX_RISK_REWARD_RATIO * 100) / (NEAR_EXPIRY_MAX_RISK_REWARD_RATIO + 1));
+function aggressiveCapCents(tauSec) {
+  return tauSec <= NEAR_EXPIRY_CAP_SEC ? NEAR_EXPIRY_CAP_CENTS : AGGRESSIVE_CAP_CENTS;
+}
+const B = Number(process.env.MMP_LIQUIDITY_B || 400);
+
+const redis = new Redis(REDIS);
+const db = await mysql.createPool(MYSQL);
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION, endpoint: DDB_ENDPOINT, credentials: AWS_CREDS }));
+
+function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+
+async function quoteMarket(marketId) {
+  const spotRaw = await redis.get(`CRYPTO_SPOT_${SYMBOL}`);
+  const metaRaw = await redis.get(`MMP_MARKET_META_${marketId}`);
+  if (!spotRaw || !metaRaw) return;
+  const spot = JSON.parse(spotRaw).price;
+  const { strike, expiryTs } = JSON.parse(metaRaw);
+  const tauSec = (expiryTs - Date.now()) / 1000;
+  if (tauSec <= 0) return;
+
+  // Fair value: Black-Scholes (constant-vol) by default, or the empirical
+  // piecewise-linear curve calibrated to real observed Polymarket pricing
+  // (rollback: EMPIRICAL_FAIR_VALUE unset/0 = Black-Scholes, as before).
+  // See pricing.mjs's empiricalProbYes for the calibration + its caveats.
+  // Computed BEFORE the lockout/directional decision below — that decision
+  // now runs off fair value itself, not just the clock.
+  const fairYes = EMPIRICAL_FAIR_VALUE
+    ? empiricalProbYes(spot, strike, tauSec, REF_SEC_FOR_EMPIRICAL)
+    : digitalProbYes(spot, strike, SIGMA_PER_SEC, tauSec);
+
+  // Directional mode: triggers whenever fair value is extreme enough
+  // (>=DIRECTIONAL_FAIR_VALUE_THRESHOLD or <=1-that), AT ANY TAU — not gated
+  // to the last EXPIRY_LOCKOUT_SEC. When it IS directional: keep bidding the
+  // FAVORED side (not the underdog) — that's the side we want the house to
+  // end up holding, since it's the one statistically likely to pay out. The
+  // underdog gets no direct house bid at all; a user buying the underdog
+  // matches against this SAME favored-side bid (userNoBuyPrice = 100 -
+  // houseYesBid, and vice versa — GameBull's matcher pairs a YES bid against
+  // a NO bid at complementary prices), so pricing the favored side
+  // aggressively (near 99c, reflecting near-certainty) is what makes the
+  // underdog cheap for a risk-taker, not a separate low bid on the underdog.
+  let favoredSide = null; // 'yes' | 'no' | null
+  if (fairYes >= DIRECTIONAL_FAIR_VALUE_THRESHOLD) favoredSide = 'yes';
+  else if (fairYes <= 1 - DIRECTIONAL_FAIR_VALUE_THRESHOLD) favoredSide = 'no';
+
+  if (favoredSide) {
+    console.log(`  [mmp] ${marketId} ⏸ directional (τ=${tauSec.toFixed(0)}s, fairYes=${(fairYes * 100).toFixed(1)}%, spot $${spot.toFixed(0)} vs K $${strike}) — ${favoredSide.toUpperCase()} favored, bidding it aggressively so the underdog prices cheap`);
+  } else if (tauSec <= EXPIRY_LOCKOUT_SEC) {
+    // Inside the final window and NOT extreme enough for directional mode —
+    // genuinely too uncertain to keep taking new inventory on either side
+    // this close to the gamma wall. Full lockout, both sides dark.
+    console.log(`  [mmp] ${marketId} ⏸ expiry lockout (τ=${tauSec.toFixed(0)}s, fairYes=${(fairYes * 100).toFixed(1)}% — not extreme enough for directional mode)`);
+    return;
+  }
+
+  // Dynamic, delta-aware inventory cap (see DYNAMIC_INV_CAP_ENABLED comment
+  // above) — tightens INV_LIMIT down to whatever HEDGE_MAX_NOTIONAL_USDT can
+  // actually cover at the CURRENT dpdS, never loosens it. Rollback: flip
+  // MMP_DYNAMIC_INV_CAP=0.
+  const dpdS = digitalDelta(spot, strike, SIGMA_PER_SEC, Math.max(tauSec, MIN_TAU_FOR_DELTA_SEC));
+  const dynamicCap = dpdS > 0 ? Math.floor(HEDGE_MAX_NOTIONAL_USDT / (dpdS * spot)) : INV_LIMIT;
+  const effectiveInvLimit = DYNAMIC_INV_CAP_ENABLED ? Math.max(0, Math.min(INV_LIMIT, dynamicCap)) : INV_LIMIT;
+  if (DYNAMIC_INV_CAP_ENABLED && dynamicCap < INV_LIMIT) {
+    console.log(`  [mmp] ${marketId} dynamic inv cap: ${effectiveInvLimit} (flat ${INV_LIMIT}, dpdS=${dpdS.toFixed(5)} implies ${dynamicCap} shares fit $${HEDGE_MAX_NOTIONAL_USDT} hedge budget)`);
+  }
+
+  // inventory-mirror publishes with a documented swap: MMP_LMSR_QUANTITY_YES =
+  // houseNo, MMP_LMSR_QUANTITY_NO = houseYes.
+  const qYesRaw = Number(await redis.get(`MMP_LMSR_QUANTITY_YES_${marketId}`) || 0);
+  const qNoRaw = Number(await redis.get(`MMP_LMSR_QUANTITY_NO_${marketId}`) || 0);
+  const houseYes = qNoRaw, houseNo = qYesRaw;
+  const netSkew = qYesRaw - qNoRaw; // = houseNo - houseYes
+
+  const flowImbalance = await orderFlowImbalance(marketId);
+
+  const qp = { gamma: GAMMA, sigma: SIGMA_P, k: K, gammaWiden: GAMMA_WIDEN, invWiden: INV_WIDEN, flowWiden: FLOW_WIDEN };
+  const { bid, ask } = dynamicSpread(fairYes, netSkew, B, tauSec, qp, flowImbalance);
+  // Complementary matching: a user's YES-buy price = 100 - (house's NO-bid
+  // price); a user's NO-buy price = 100 - (house's YES-bid price). We want
+  // the user-facing YES-buy price to be `ask` and the user-facing NO-buy
+  // price to be `100-bid` (buying NO = selling YES, priced off `bid`).
+  let houseYesTouchCents = toTick(bid * 100, TICK);       // optionId 1 — filling it GROWS houseYes
+  let houseNoTouchCents = toTick((1 - ask) * 100, TICK);  // optionId 2 — filling it GROWS houseNo
+
+  // Directional lockout: override the favored side's touch with an
+  // odds-driven price straight off fair probability — skipping the normal
+  // dynamicSpread defensive padding AND its [0.03,0.97] house-quote clamp
+  // (both exist to protect against adverse selection risk this scenario
+  // doesn't have — we already know which way this is leaning) — but cap it
+  // at AGGRESSIVE_CAP_CENTS (95c): past that the risk:reward the HOUSE takes
+  // on for the favored bid itself is too lopsided (see the derivation
+  // above), so don't chase fair value any further even if it implies more.
+  //
+  // Note this is a cap on OUR bid, not a switch to bidding the underdog
+  // directly — bestBid/bestAsk are asymmetric (server.mjs bestBidAsk():
+  // bestBid comes from the resting YES book, bestAsk = 100-bestNoBid from
+  // the resting NO book) so a YES bid is what BOTH keeps YES itself
+  // structurally "no liquidity" for a direct buyer (no NO-side bid is ever
+  // posted here) AND is what makes NO cheap for a buyer (NO price =
+  // 100-bestBid). Posting a NO bid instead would do the reverse of both.
+  if (favoredSide) {
+    const favoredFairProb = favoredSide === 'yes' ? fairYes : 1 - fairYes;
+    const rawCents = Math.round((favoredFairProb * 100) / TICK) * TICK;
+    const capNow = aggressiveCapCents(tauSec);
+    const aggressiveCents = Math.max(TICK, Math.min(capNow, rawCents));
+    if (rawCents > capNow) {
+      const nearExpiry = tauSec <= NEAR_EXPIRY_CAP_SEC;
+      const r = nearExpiry ? NEAR_EXPIRY_MAX_RISK_REWARD_RATIO : MAX_RISK_REWARD_RATIO;
+      console.log(`  [mmp] ${marketId} favored ${favoredSide.toUpperCase()} capped at ${capNow}¢ (fair implied ${rawCents}¢, R=${r}:1${nearExpiry ? ` near-expiry (τ≤${NEAR_EXPIRY_CAP_SEC}s)` : ''} risk:reward limit)`);
+    }
+    if (favoredSide === 'yes') houseYesTouchCents = aggressiveCents; else houseNoTouchCents = aggressiveCents;
+  }
+
+  // Progressive quote-size adjustment (primary exposure lever) + hard gate
+  // (final backstop) — neither touches price, both are pure sizing/gating.
+  // Worst-case per-side depth (every level maxed out) bounds the room request;
+  // actual posted depth is normally far less, since AMM-implied sizing is
+  // smallest near the reservation price.
+  const yesRoom = quoteSize(LADDER_MAX_QTY * LADDER_LEVELS, houseYes, houseNo, 'yes', effectiveInvLimit);
+  const noRoom = quoteSize(LADDER_MAX_QTY * LADDER_LEVELS, houseYes, houseNo, 'no', effectiveInvLimit);
+  const yesGateOk = (favoredSide == null || favoredSide === 'yes') && withinLimit(houseYes, houseNo, 'yes', effectiveInvLimit) && yesRoom > 0;
+  const noGateOk = (favoredSide == null || favoredSide === 'no') && withinLimit(houseYes, houseNo, 'no', effectiveInvLimit) && noRoom > 0;
+
+  // Time-decaying b: full depth (AMM_B_MAX) most of the market's life,
+  // shrinking toward AMM_B_MIN — and its bounded b·ln(2) worst-case loss —
+  // as the expiry lockout approaches. Same τ clock dynamicSpread's pinRisk
+  // term already uses, so spread-widening and depth-shrinking move together.
+  const ammB = ammBForTau(tauSec, AMM_B_MAX, AMM_B_MIN);
+
+  // Build the ladder: level 0 is the touch, each subsequent level steps AWAY
+  // (house bids lower), so the user's effective price gets progressively worse
+  // the deeper they sweep — the CLOB analogue of AMM price impact. The AMM
+  // decides HOW MUCH sits at each rung (lmsrStepQty — the LMSR-implied share
+  // count to walk its own price across that one-tick step), not a flat
+  // constant; the risk gate still bounds cumulative exposure across the whole
+  // ladder, same as before.
+  const posts = [];
+  let yesRemaining = yesRoom, noRemaining = noRoom;
+  for (let i = 0; i < LADDER_LEVELS; i++) {
+    if (yesGateOk && yesRemaining > 0) {
+      const pFrom = clamp01((houseYesTouchCents - i * LADDER_STEP) / 100);
+      const pTo = clamp01((houseYesTouchCents - (i + 1) * LADDER_STEP) / 100);
+      const ammQty = lmsrStepQty(pFrom, pTo, ammB);
+      const qty = Math.min(LADDER_MAX_QTY, yesRemaining, Math.max(LADDER_MIN_QTY, Math.round(ammQty)));
+      if (qty > 0) { posts.push([1, toTick(houseYesTouchCents - i * LADDER_STEP, TICK), qty]); yesRemaining -= qty; }
+    }
+    if (noGateOk && noRemaining > 0) {
+      const pFrom = clamp01((houseNoTouchCents - i * LADDER_STEP) / 100);
+      const pTo = clamp01((houseNoTouchCents - (i + 1) * LADDER_STEP) / 100);
+      const ammQty = lmsrStepQty(pFrom, pTo, ammB);
+      const qty = Math.min(LADDER_MAX_QTY, noRemaining, Math.max(LADDER_MIN_QTY, Math.round(ammQty)));
+      if (qty > 0) { posts.push([2, toTick(houseNoTouchCents - i * LADDER_STEP, TICK), qty]); noRemaining -= qty; }
+    }
+  }
+
+  // ── Skip the cancel+repost when the change is not economically material ───
+  // Root cause of the residual "both sides empty" flashes, measured 2026-07-31:
+  // 92.3% of watcher gap events start within the cancel window, median offset
+  // +0.000s — the gap IS this cancel, not CPU/RAM contention. (Docker sat at
+  // 51% of its 4.8GB allocation with pageouts ~200KB/s at the time, versus the
+  // 260-525MB/s seen during the genuine swap-thrash incident of 2026-07-30, so
+  // raising Docker RAM would not have touched this.)
+  //
+  // Moving the cancel later and parallelising it (comments below) only SHRANK
+  // the window; delete-all-then-insert-all can never reach zero. The real
+  // question is how often the rewrite is worth paying that window for, and
+  // measured over 297 live cycles it usually is not: the median touch move is
+  // 0.10¢ against a ~3¢ quoted spread, 44.1% of cycles leave touch prices
+  // BYTE-IDENTICAL, and 76.1% move depth by under 2%.
+  //
+  // An exact-equality check was tried first and fired ZERO times, because the
+  // LMSR b shrinks continuously with tau, so ladder QUANTITIES drift ~1% every
+  // cycle even when prices are frozen (7565 -> 7498 -> 7434 sh observed live).
+  // Hence a materiality threshold rather than equality: emptying the book for
+  // a guaranteed ~600ms to correct a 0.1¢ quote error is a bad trade, since a
+  // 0.1¢-stale quote sits far inside our own spread while an empty book is a
+  // 100% liquidity loss.
+  //
+  // Safety guards — requote UNCONDITIONALLY when staleness actually costs:
+  //   • near expiry (tau <= REQUOTE_ALWAYS_BELOW_TAU) where gamma explodes and
+  //     a stale quote is exactly what pin risk picks off (§ gamma wall);
+  //   • when either intended side has NO resting rows (nothing to preserve);
+  //   • when the set of quoted sides changed (a risk/directional gate flipped).
+  // 0.3¢ -> 0.1¢ (one tick). The wider band existed to buy fewer empty-book
+  // windows; with make-before-break there are none, so the maker can track
+  // price to the tick instead of tolerating up to 3 ticks of staleness.
+  const REQUOTE_MIN_MOVE_CENTS = Number(process.env.MMP_REQUOTE_MIN_MOVE || 0.1);
+  const REQUOTE_MIN_DEPTH_PCT = Number(process.env.MMP_REQUOTE_MIN_DEPTH_PCT || 0.05);
+  const REQUOTE_ALWAYS_BELOW_TAU = Number(process.env.MMP_REQUOTE_ALWAYS_BELOW_TAU || 60);
+  // bid_amount is stored as cents x100 (81.4¢ -> 8140) — verified against live
+  // rows before relying on it; a units error here would skip forever in silence.
+  const restingOf = async (side) => {
+    try {
+      const [rows] = await db.query(
+        `SELECT bid_amount, current_bid_count FROM \`bb_available_bids_${side}_${marketId}\`
+         WHERE user_id = ? AND is_matched = 0`, [MMP_USER_ID]);
+      if (!rows.length) return null;
+      return {
+        touch: Math.max(...rows.map((r) => Number(r.bid_amount) / 100)),
+        depth: rows.reduce((a, r) => a + Number(r.current_bid_count), 0),
+      };
+    } catch { return null; }
+  };
+  const desiredOf = (optionId) => {
+    const mine = posts.filter((p) => p[0] === optionId);
+    if (!mine.length) return null;
+    return { touch: Math.max(...mine.map((p) => p[1])), depth: mine.reduce((a, p) => a + p[2], 0) };
+  };
+  const [rY, rN] = await Promise.all([restingOf('yes'), restingOf('no')]);
+  const dY = desiredOf(1), dN = desiredOf(2);
+  const immaterial = (r, d) => {
+    if (r === null && d === null) return true;      // side intentionally quiet, still quiet
+    if (r === null || d === null) return false;     // side turning on or off — must act
+    return Math.abs(r.touch - d.touch) < REQUOTE_MIN_MOVE_CENTS
+        && Math.abs(r.depth - d.depth) / Math.max(1, r.depth) < REQUOTE_MIN_DEPTH_PCT;
+  };
+  if (tauSec > REQUOTE_ALWAYS_BELOW_TAU && immaterial(rY, dY) && immaterial(rN, dN)) {
+    await redis.set(`app:mm:lastQuoteFair:${marketId}`, fairYes);
+    console.log(`  [mmp] ${marketId} requote skipped — change immaterial (book left resting, no empty-book window)`);
+    return;
+  }
+
+  // ── MAKE BEFORE BREAK ─────────────────────────────────────────────────────
+  // Previously this CANCELLED both sides here and reposted below, i.e.
+  // delete-all-then-insert-all. That structure ALWAYS leaves a hole: measured
+  // 2026-07-31, 92.3% of watcher gap events began at the cancel instant
+  // (median offset +0.000s), 197/203 of them on BOTH sides at once. Earlier
+  // fixes (cancel moved later, cancel+repost parallelised) only shrank the
+  // hole; they could not remove it, because the book is genuinely empty
+  // between the DELETE and the first repost landing.
+  //
+  // What real venues do instead: Kalshi exposes atomic `amend_v2` (modify in
+  // place) plus batched order ops; Polymarket exposes batch post and batch
+  // cancel so a maker can move a whole ladder in one round trip. We cannot add
+  // an amend verb to GameBull's matching engine (read-only production), but we
+  // do NOT need to: cancellation here is a direct MySQL DELETE that we own
+  // outright, not a matcher call. So we can reorder to make-before-break:
+  //   1. snapshot the row_ids currently resting,
+  //   2. post the NEW ladder (book now transiently holds BOTH),
+  //   3. delete exactly the snapshotted rows.
+  // The book is never empty — worst case it is briefly deeper than intended,
+  // which is a strictly safer failure than being empty. The snapshot is
+  // essential: a fresh "cancel all my unmatched rows" query at step 3 would
+  // also match the ladder just posted and wipe it.
+  const [preYes, preNo] = await Promise.all([
+    snapshotRestingRows(marketId, 'yes', MMP_USER_ID, db),
+    snapshotRestingRows(marketId, 'no', MMP_USER_ID, db),
+  ]);
+
+  // Parallelized (was sequential) for the same reason cancellation was above:
+  // found live (2026-07-29) that even after moving cancellation right before
+  // reposting, a sequential repost loop (up to LADDER_LEVELS*2 awaited
+  // placeBid round-trips) kept the book meaningfully empty far longer than
+  // "cancel + first repost" — during active repricing the cycle repeats often
+  // enough that this was a real, repeatedly-reproducible empty-book flash on
+  // BOTH sides, not just the original NO-only race. Each post is independent
+  // (own bidId, no shared state) except the quotecount INCR, which is atomic
+  // and order-independent — safe to fire concurrently.
+  // try/catch per post (2026-07-30): placeBid now has a bounded timeout
+  // (pricing.mjs), but Promise.all still REJECTS the whole batch if any one
+  // call throws — which would propagate out of quoteMarket() and abort
+  // quoteAll()'s for-loop, skipping every OTHER market in this cycle too,
+  // not just this one's remaining posts. Catching per-post keeps one timed-
+  // out bid from taking down quoting for markets that have nothing to do
+  // with it.
+  await Promise.all(posts.map(async ([optionId, price, qty]) => {
+    try {
+      const res = await placeBid(MATCHER, {
+        marketId, bidId: bidId(`mmp${optionId}`), userId: MMP_USER_ID,
+        optionId, bidAmount: price, buyingPrice: price, currentBidCount: qty,
+        bidCount: qty, mmpPriceVersion: MMP_VERSION,
+      });
+      if (res.status !== 200) console.log(`  [mmp] ${marketId} opt${optionId} @ ${price}¢ x${qty} → HTTP ${res.status} ${String(res.body).slice(0, 80)}`);
+      await redis.incr('app:mm:quotecount'); // calibration: quoteFillRate denominator (§7)
+    } catch (e) {
+      console.log(`  [mmp] ${marketId} opt${optionId} @ ${price}¢ x${qty} → placeBid failed: ${String(e.name || e).slice(0, 60)}`);
+    }
+  }));
+  // …now retire the OLD ladder. New quotes are already resting, so this cannot
+  // empty the book. Overlap window is one placeBid round trip (~100ms) during
+  // which depth is doubled; the risk gate re-evaluates next cycle and the stale
+  // side is priced worse than the fresh one, so it is not preferentially hit.
+  const [cancelledYes, cancelledNo] = await Promise.all([
+    cancelRestingRows(marketId, 'yes', MMP_USER_ID, db, ddb, preYes),
+    cancelRestingRows(marketId, 'no', MMP_USER_ID, db, ddb, preNo),
+  ]);
+  if (cancelledYes || cancelledNo) console.log(`  [mmp] ${marketId} retired ${cancelledYes}+${cancelledNo} stale quotes (after repost)`);
+
+  const yesDepth = posts.filter((p) => p[0] === 1).reduce((s, p) => s + p[2], 0);
+  const noDepth = posts.filter((p) => p[0] === 2).reduce((s, p) => s + p[2], 0);
+  console.log(`  [mmp] ${marketId} ladder: YES ${yesDepth} sh from ${houseYesTouchCents}¢ · NO ${noDepth} sh from ${houseNoTouchCents}¢ · user market ${100 - houseNoTouchCents}/${100 - houseYesTouchCents}¢ (spread ${(100 - houseNoTouchCents) + (100 - houseYesTouchCents) - 100}¢) · b=${ammB.toFixed(0)} (max loss ≈$${(ammB * Math.LN2).toFixed(0)})`);
+  if (!yesGateOk) console.log(`  [mmp] ${marketId} YES side skipped (${favoredSide === 'no' ? 'directional lockout — underdog, no direct bid needed' : `risk gate: houseYes=${houseYes} limit=${effectiveInvLimit}`})`);
+  if (!noGateOk) console.log(`  [mmp] ${marketId} NO side skipped (${favoredSide === 'yes' ? 'directional lockout — underdog, no direct bid needed' : `risk gate: houseNo=${houseNo} limit=${effectiveInvLimit}`})`);
+
+  await redis.set(`app:mm:lastQuoteFair:${marketId}`, fairYes);
+  console.log(`  [mmp] fair YES ${(fairYes * 100).toFixed(1)}¢ (spot $${spot.toFixed(0)}, K $${strike}, τ ${tauSec.toFixed(0)}s, netSkew ${netSkew}, flow ${flowImbalance.toFixed(2)})`);
+}
+
+async function quoteAll(only) {
+  const ids = only ? [only] : await redis.smembers('predictor_active_markets');
+  if (!ids.length) { console.log('[mmp] no active markets'); return; }
+  // try/catch per market (2026-07-30, defense in depth alongside placeBid's
+  // own try/catch above): an uncaught throw from ANY market here previously
+  // aborted this whole for-loop, silently skipping every market after it in
+  // ids order for the rest of this cycle — one market's bad state could
+  // starve unrelated markets of a quote, not just itself.
+  for (const id of ids) {
+    try { await quoteMarket(id); } catch (e) { console.log(`  [mmp] ${id} quoteMarket failed: ${String(e.name || e).slice(0, 80)}`); }
+  }
+}
+
+(async () => {
+  const only = process.argv[2];
+  await quoteAll(only);
+  if (process.env.LOOP === '1') {
+    // Configurable (2026-07-30): server.mjs now runs exactly ONE persistent
+    // instance of this in LOOP mode as the sole quoting authority — see
+    // "Persistent quoting worker" in server.mjs. Interval tunable via env
+    // since that call site owns the actual value (MMP_QUOTER_LOOP_MS).
+    const intervalMs = Number(process.env.MMP_LOOP_INTERVAL_MS || 5000);
+    setInterval(() => quoteAll(only).catch((e) => console.error(e.message)), intervalMs);
+  } else { await db.end(); process.exit(0); }
+})();

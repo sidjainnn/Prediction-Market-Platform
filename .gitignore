@@ -1,0 +1,22 @@
+# dependencies
+node_modules/
+
+# secrets — never commit
+# Any *.env is treated as secret by default, including run/services.env.
+# If one of these is genuinely a non-secret template, add an explicit
+# !exception for it after checking what is actually inside.
+.env
+.env.*
+*.env
+!*.env.example
+!.env.example
+
+# runtime logs (regenerable, ~197MB, and too large for git)
+logs/
+*.log
+data/*.log
+
+# local runtime state
+dist/
+.DS_Store
+localstack/volume/

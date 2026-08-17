@@ -1,0 +1,16 @@
+{
+  "name": "gb-crypto-local",
+  "private": true,
+  "type": "module",
+  "description": "Local full-fidelity stack + drivers for the GameBull crypto vertical",
+  "scripts": {
+    "schema": "node setup/create-schema.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-sqs": "^3.1085.0",
+    "@aws-sdk/lib-dynamodb": "^3.1084.0",
+    "ioredis": "^5.4.1",
+    "mysql2": "^3.11.0"
+  }
+}

@@ -1,0 +1,1020 @@
+<!doctype html><html lang="en"><head>
+<meta charset="utf8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BitBull — Crypto Predictions</title>
+<style>
+:root{--bg:#0b0e14;--card:#141925;--card2:#1a2030;--line:#232b3d;--ink:#eef2f8;--sub:#8a95a8;
+ --yes:#22c55e;--yes-bg:#122a1c;--no:#ef4444;--no-bg:#2a1414;--accent:#5b8cff;--gold:#e0a030;}
+*{box-sizing:border-box}
+body{margin:0;font-family:'Inter',ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased}
+.hidden{display:none!important}
+button{font-family:inherit;cursor:pointer;border:none}
+/* login */
+#login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:radial-gradient(1200px 600px at 50% -10%,#1a2740,#0b0e14)}
+.login-card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:34px 30px;width:340px;text-align:center;box-shadow:0 30px 80px #0008}
+.logo{font-size:26px;font-weight:800;letter-spacing:-.5px}.logo span{color:var(--gold)}
+.login-card p{color:var(--sub);font-size:13px;margin:6px 0 22px}
+.login-card input{width:100%;padding:13px 14px;border-radius:11px;background:var(--card2);border:1px solid var(--line);color:var(--ink);font-size:15px;margin-bottom:12px;outline:none}
+.login-card input:focus{border-color:var(--accent)}
+.btn-primary{width:100%;padding:13px;border-radius:11px;background:var(--accent);color:#fff;font-weight:700;font-size:15px}
+/* header */
+header{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:18px;padding:12px 20px;background:#0d111aee;backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+header .logo{font-size:19px}
+nav{display:flex;gap:4px;margin-left:8px}
+nav button{padding:8px 14px;border-radius:9px;background:transparent;color:var(--sub);font-weight:600;font-size:13.5px}
+nav button.active{background:var(--card2);color:var(--ink)}
+.spacer{flex:1}
+.spot{font-variant-numeric:tabular-nums;font-weight:700;font-size:14px}.spot .k{color:var(--sub);font-weight:500;font-size:11px;margin-right:5px}
+.wallet{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:7px 12px;font-weight:700;font-variant-numeric:tabular-nums}
+.who{color:var(--sub);font-size:13px}.who b{color:var(--ink)}
+.link{background:none;color:var(--sub);font-size:12px}
+main{max-width:1080px;margin:0 auto;padding:22px 20px 60px}
+h2{font-size:15px;color:var(--sub);font-weight:600;margin:0 0 14px;text-transform:uppercase;letter-spacing:.5px}
+/* market cards */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,320px));gap:14px;justify-content:start}
+.mkt{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;transition:border-color .15s;cursor:pointer}
+.mkt:hover{border-color:#33405e}
+.mkt .q{font-weight:650;font-size:15px;line-height:1.35;margin-bottom:4px}
+.mkt .q:hover{color:var(--accent)}
+.mkt .meta{color:var(--sub);font-size:12px;display:flex;gap:10px;margin-bottom:14px}
+.mkt .cd{color:var(--gold);font-variant-numeric:tabular-nums}
+.sides{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.side{border-radius:11px;padding:11px;text-align:center;border:1px solid transparent;transition:transform .08s}
+.side:active{transform:scale(.97)}
+.side .lab{font-size:12px;font-weight:700;letter-spacing:.4px}.side .px{font-size:22px;font-weight:800;font-variant-numeric:tabular-nums;margin-top:2px}
+.yes{background:var(--yes-bg);color:var(--yes);border-color:#1c4029}.yes:hover{border-color:var(--yes)}
+.no{background:var(--no-bg);color:var(--no);border-color:#4a1f1f}.no:hover{border-color:var(--no)}
+/* No resting liquidity on this side right now — grey it out and block the
+   click, instead of letting the user submit a trade that's just going to
+   fail with "No liquidity available". */
+.side.disabled{background:var(--card2);color:var(--sub);border-color:var(--line);cursor:not-allowed;opacity:.6}
+.side.disabled:hover{border-color:var(--line)}
+.side.disabled:active{transform:none}
+.side.disabled .px{font-size:13px;font-weight:700}
+/* ticket modal */
+#modal{position:fixed;inset:0;background:#000a;display:flex;align-items:flex-end;justify-content:center;z-index:20}
+@media(min-width:640px){#modal{align-items:center}}
+.ticket{background:var(--card);border:1px solid var(--line);border-radius:18px 18px 0 0;padding:22px;width:100%;max-width:420px}
+@media(min-width:640px){.ticket{border-radius:18px}}
+.ticket h3{margin:0 0 2px;font-size:16px}.ticket .sub{color:var(--sub);font-size:12.5px;margin-bottom:16px}
+.pill{display:inline-block;padding:5px 11px;border-radius:20px;font-weight:800;font-size:13px}
+.qtyrow{display:flex;align-items:center;gap:10px;margin:16px 0}
+.qtyrow button{width:42px;height:42px;border-radius:11px;background:var(--card2);color:var(--ink);font-size:20px;border:1px solid var(--line)}
+.qtyrow input{flex:1;text-align:center;font-size:20px;font-weight:700;background:var(--card2);border:1px solid var(--line);border-radius:11px;padding:10px;color:var(--ink);outline:none}
+.costrow{display:flex;justify-content:space-between;font-size:13px;color:var(--sub);margin:5px 0}
+.costrow b{color:var(--ink);font-variant-numeric:tabular-nums}
+.ticket .place{margin-top:14px}.ticket .cancel{width:100%;padding:11px;background:none;color:var(--sub);margin-top:6px;font-size:13px}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--card2);border:1px solid var(--line);padding:11px 18px;border-radius:11px;font-size:13.5px;z-index:30;box-shadow:0 10px 30px #0008}
+/* portfolio + tables */
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line)}
+th{color:var(--sub);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+td{font-variant-numeric:tabular-nums}
+.pos{color:var(--yes)}.neg{color:var(--no)}
+.stat-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
+/* min-width:0 is load-bearing: grid items default to min-width:auto, which
+   refuses to shrink below the intrinsic width of unbreakable content (a long
+   "$-1,234.56" token) — that's what pushed the Net MM value out of its box. */
+.stat{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:15px;min-width:0}
+.stat .k{color:var(--sub);font-size:11.5px;text-transform:uppercase;letter-spacing:.4px}
+.stat .v{font-size:26px;font-weight:800;font-variant-numeric:tabular-nums;margin-top:4px;overflow-wrap:break-word}
+.stat.big .v{font-size:30px}
+.cols{display:grid;grid-template-columns:1.4fr 1fr;gap:16px}@media(max-width:760px){.cols{grid-template-columns:1fr}}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+.hedge-badge{display:inline-block;padding:6px 13px;border-radius:9px;font-weight:800;font-size:15px}
+.logbox{font-family:ui-monospace,monospace;font-size:11.5px;color:var(--sub);line-height:1.7;max-height:280px;overflow:auto}
+.mut{color:var(--sub);font-size:12px}
+/* market detail page */
+.detail-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap;margin-bottom:16px}
+.detail-head h1{font-size:19px;margin:0 0 5px;line-height:1.3}
+.detail-prices{display:flex;gap:8px;flex-shrink:0}
+/* position:relative is load-bearing — .chart-now is absolutely positioned and
+   without it the badge escapes the panel and anchors to the viewport. */
+.chart-wrap{min-width:0;position:relative}
+.chart{width:100%;height:200px;display:block}
+.chart-now{position:absolute;top:14px;right:16px;font-size:12px;font-variant-numeric:tabular-nums;color:var(--sub);text-align:right}
+.chart-now .dist{display:block;font-weight:800;font-size:15px;letter-spacing:.2px}
+.chart-lg{height:320px}
+@media(max-width:760px){.chart-lg{height:230px}}
+.matched{opacity:.45;text-decoration:line-through}
+.ob-count{font-size:11px;color:var(--sub);margin-bottom:8px}
+.trade-btn{width:100%;padding:14px;margin-bottom:9px;display:flex;justify-content:space-between;align-items:center}
+.trade-btn .lab{font-size:13px}.trade-btn .px{font-size:20px;margin-top:0}
+/* order-type segmented toggle (ticket) — was piggybacking on .qtyrow's
+   fixed 42x42px stepper-button styling, which is why it looked broken (tiny
+   square buttons fighting .btn-primary's width:100% on whichever was active). */
+.seg-toggle{display:flex;background:var(--card2);border:1px solid var(--line);border-radius:11px;padding:3px;margin:10px 0;gap:3px}
+.seg-toggle button{flex:1;padding:9px 0;border-radius:8px;background:transparent;color:var(--sub);font-weight:700;font-size:13.5px}
+.seg-toggle button.active{background:var(--accent);color:#fff}
+/* order book depth ladder — aggregated by price level (not one row per
+   individual order) and sorted best-price-first, matching Kalshi/Polymarket's
+   own book presentation. Previously rendered raw un-aggregated rows sorted by
+   row_id (insertion order), so a freshly-placed order could show up anywhere
+   in the list regardless of its actual price rank. */
+.ladder{font-size:12.5px}
+.level{position:relative;padding:6px 8px;margin-bottom:2px;border-radius:6px;overflow:hidden}
+.level .bar{position:absolute;inset:0;right:auto;background:#ffffff0d;z-index:0}
+.level .lmain{position:relative;z-index:1;display:flex;justify-content:space-between}
+.level .lprice,.level .lqty{font-variant-numeric:tabular-nums}
+.level .lprice{font-weight:700}
+.level.mine{outline:1px solid var(--accent)}
+.level .you{color:var(--accent);font-weight:700}
+.level .lprice .you{margin-left:6px;font-size:11px}
+/* per-contributor breakdown at this price level, e.g. "Alice 25, HOUSE 776" —
+   other players' resting size is visible by name, not just an anonymized
+   aggregate total. */
+.level .lwho{position:relative;z-index:1;color:var(--sub);font-size:10.5px;margin-top:3px;overflow-wrap:anywhere}
+.level .ob-cancel{position:relative;z-index:1;margin-left:8px;background:none;color:var(--sub);border:1px solid var(--line);border-radius:6px;width:20px;height:20px;font-size:11px;line-height:1;padding:0}
+.level .ob-cancel:hover{color:var(--no);border-color:var(--no)}
+.ladder .empty{color:var(--sub);padding:10px 8px;text-align:center}
+</style></head><body>
+
+<!-- LOGIN -->
+<div id="login">
+  <div class="login-card">
+    <div class="logo">Bit<span>Bull</span></div>
+    <p>Crypto prediction markets · office demo</p>
+    <input id="name" placeholder="Enter your name" maxlength="24" autofocus>
+    <button class="btn-primary" onclick="doLogin()">Start trading →</button>
+    <p style="margin-top:16px;font-size:11px">No password. You get $1,000 to trade.</p>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="app" class="hidden">
+  <header>
+    <div class="logo">Bit<span>Bull</span></div>
+    <nav>
+      <button data-tab="markets" class="active" onclick="tab('markets')">Markets</button>
+      <button data-tab="portfolio" onclick="tab('portfolio')">Portfolio</button>
+      <button data-tab="mm" onclick="tab('mm')">🛡 Hedge Desk</button>
+      <button data-tab="liq" onclick="tab('liq')">📶 Liquidity Watch</button>
+    </nav>
+    <div class="spacer"></div>
+    <div class="spot"><span class="k">BTC</span><span id="spot">–</span></div>
+    <div class="wallet" id="bal" onclick="openWallet()" title="View wallet transactions" style="cursor:pointer">$–</div>
+    <div class="who">👤 <b id="uname"></b></div>
+    <button class="link" onclick="logout()">exit</button>
+  </header>
+  <main>
+    <section id="tab-markets"><h2>Live markets</h2><div class="grid" id="markets"></div></section>
+    <section id="tab-portfolio" class="hidden">
+      <div class="stat-row">
+        <div class="stat"><div class="k">Wallet</div><div class="v" id="p-bal">$–</div></div>
+        <div class="stat"><div class="k">Realized P&L</div><div class="v" id="p-real">$–</div></div>
+        <div class="stat"><div class="k">Open positions</div><div class="v" id="p-open">–</div></div>
+      </div>
+      <div class="panel"><h2 style="margin-bottom:10px">Open positions</h2><table><thead><tr><th>Market</th><th>Side</th><th>Qty</th><th>Avg</th><th>Mark</th><th>Unreal. P&L</th></tr></thead><tbody id="p-pos"></tbody></table></div>
+      <div class="panel" style="margin-top:16px"><h2 style="margin-bottom:4px">Settled — closed &amp; paid out</h2>
+        <div class="mut" style="margin-bottom:10px">Positions close automatically when their 5-minute market expires. Payout is credited to your wallet and the P&amp;L below is final.</div>
+        <table><thead><tr><th>Market</th><th>Side</th><th>Qty</th><th>Avg</th><th>Settled at</th><th>Realized P&L</th></tr></thead><tbody id="p-hist"></tbody></table></div>
+    </section>
+    <section id="tab-mm" class="hidden">
+      <div style="display:flex;justify-content:flex-end;margin-bottom:10px">
+        <button class="link" style="border:1px solid var(--line);border-radius:9px;padding:7px 13px" onclick="doRoundReset()">🔄 New round (reset all wallets)</button>
+      </div>
+      <div class="stat-row">
+        <div class="stat big"><div class="k">Net MM P&L</div><div class="v" id="m-net">$–</div></div>
+        <div class="stat"><div class="k">Realized spread</div><div class="v" id="m-realspread">$–</div></div>
+        <div class="stat"><div class="k">Fee revenue</div><div class="v" id="m-fee">$–</div></div>
+        <div class="stat"><div class="k">Inventory P&L</div><div class="v" id="m-invpnl">$–</div></div>
+        <div class="stat"><div class="k">Hedge P&L</div><div class="v" id="m-hpnl">$–</div></div>
+        <div class="stat"><div class="k">Settlement P&L</div><div class="v" id="m-inv">$–</div></div>
+        <div class="stat"><div class="k">Quoted spread (theoretical)</div><div class="v" id="m-vig">$–</div></div>
+        <div class="stat"><div class="k">Volume (contracts)</div><div class="v" id="m-vol">–</div></div>
+      </div>
+      <div class="stat-row">
+        <div class="stat"><div class="k">Quote fill rate</div><div class="v" id="c-fillrate">–</div></div>
+        <div class="stat"><div class="k">Adverse selection (¢)</div><div class="v" id="c-adverse">–</div></div>
+        <div class="stat"><div class="k">Inventory turnover</div><div class="v" id="c-turnover">–</div></div>
+        <div class="stat"><div class="k">Spread capture efficiency</div><div class="v" id="c-efficiency">–</div></div>
+      </div>
+      <div class="cols">
+        <div class="panel">
+          <h2 style="margin-bottom:10px">Live hedge position</h2>
+          <div id="m-hedge"></div>
+          <div class="mut" style="margin-top:10px">The perp position (demo) that neutralises the house's net BTC exposure across all open markets.</div>
+        </div>
+        <div class="panel">
+          <h2 style="margin-bottom:10px">Leaderboard</h2>
+          <table><tbody id="m-board"></tbody></table>
+        </div>
+      </div>
+      <div class="panel" style="margin-top:16px"><h2 style="margin-bottom:8px">Activity</h2><div class="logbox" id="m-log"></div></div>
+    </section>
+
+    <section id="tab-liq" class="hidden">
+      <div class="stat-row">
+        <div class="stat big"><div class="v" id="liq-status">–</div><div class="k">Watcher status</div></div>
+        <div class="stat"><div class="v" id="liq-active">–</div><div class="k">Sides empty right now</div></div>
+        <div class="stat"><div class="v" id="liq-lastupdate">–</div><div class="k">Last update</div></div>
+      </div>
+      <div class="panel" style="margin-top:16px">
+        <h2 style="margin-bottom:8px">Currently empty (live)</h2>
+        <div class="mut" style="margin-bottom:10px">A market/side shown here has zero resting liquidity right now, outside its legitimate expiry lockout window.</div>
+        <table><thead><tr><th>Market</th><th>Side</th><th>Empty for</th><th>τ at start</th></tr></thead><tbody id="liq-active-rows"></tbody></table>
+      </div>
+      <div class="panel" style="margin-top:16px">
+        <h2 style="margin-bottom:8px">Recent gaps (resolved)</h2>
+        <table><thead><tr><th>Market</th><th>Side</th><th>Duration</th><th>τ at start</th><th>Resolved</th></tr></thead><tbody id="liq-gap-rows"></tbody></table>
+      </div>
+    </section>
+
+    <!-- MARKET DETAIL -->
+    <section id="tab-detail" class="hidden">
+      <button class="link" style="margin-bottom:14px" onclick="location.hash=''">← Back to markets</button>
+      <div class="detail-head">
+        <div>
+          <h1 id="d-q"></h1>
+          <div class="mut">Strike $<span id="d-strike"></span> · settles in <span id="d-cd"></span></div>
+        </div>
+        <div class="detail-prices">
+          <span class="pill yes" id="d-yesprice"></span>
+          <span class="pill no" id="d-noprice"></span>
+        </div>
+      </div>
+      <!-- BTC chart gets the full width and the most height: it is the one thing
+           a trader actually reads. The strike line is drawn on it, so "are we
+           above or below?" is answerable at a glance. -->
+      <div class="cols" style="grid-template-columns:1fr 300px">
+        <div class="panel chart-wrap">
+          <h2>BTC price vs strike · live</h2>
+          <div class="chart-now"><span id="d-dist" class="dist"></span></div>
+          <canvas id="chart-price" class="chart chart-lg"></canvas>
+        </div>
+        <div class="panel" style="align-self:start">
+          <h2 style="margin-bottom:10px">Trade</h2>
+          <button class="side yes trade-btn" id="d-yesbutton" onclick="openTicket(DETAIL.marketId,'YES')"><span class="lab">BUY YES</span><span class="px" id="d-yesbtn">–</span></button>
+          <button class="side no trade-btn" id="d-nobutton" onclick="openTicket(DETAIL.marketId,'NO')"><span class="lab">BUY NO</span><span class="px" id="d-nobtn">–</span></button>
+          <div class="mut" style="margin-top:12px;line-height:1.5">Settles at <b id="d-cd2">–</b>.<br>YES pays $1 if BTC ≥ strike.</div>
+        </div>
+      </div>
+      <div class="cols" style="margin-top:14px">
+        <div class="panel" >
+          <h2 style="margin-bottom:2px">Order book &amp; resting orders</h2>
+          <div class="ob-count" id="d-obcount"></div>
+          <div class="cols">
+            <div><div class="mut" style="margin-bottom:6px">YES</div><div class="ladder" id="d-book-yes"></div></div>
+            <div><div class="mut" style="margin-bottom:6px">NO</div><div class="ladder" id="d-book-no"></div></div>
+          </div>
+        </div>
+        <div class="panel chart-wrap" style="align-self:start">
+          <h2>Market price · live <span id="d-prob" class="mut" style="font-weight:600"></span></h2>
+          <canvas id="chart-prob" class="chart" style="height:210px"></canvas>
+          <div class="mut" style="margin-top:8px">The actual tradable YES price (bid/ask mid, real fills) — not a model.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="modal" class="hidden"></div>
+<div id="toast" class="toast hidden"></div>
+
+<script>
+let U = JSON.parse(localStorage.getItem('bitbull_user') || 'null');
+let TAB = 'markets';
+let MKTS = {}, LASTIDS = '';   // market cache for the ticket + in-place updates
+const $ = (id) => document.getElementById(id);
+const setTextIfPresent = (id, text) => { const el=$(id); if(el) el.textContent=text; };
+const money = (n) => (n<0?'-':'')+'$'+Math.abs(+n).toFixed(2);
+const sign = (n) => n>0?'pos':n<0?'neg':'';
+
+async function api(path, opts){ const r = await fetch(path, opts); return r.json(); }
+// Three-layer price model: fairYes/fairNo (Layer 1, theoretical, analytics-only) vs
+// bestBid/bestAsk (Layer 2, what users actually transact at) vs marketPrice/lastTrade
+// (Layer 3, display). Users buying YES pay bestAsk; buying NO pays 100-bestBid.
+// Never show marketPrice as a price you can transact at.
+function buyPrice(m, side){
+  if(side==='YES') return m.bestAsk!=null ? m.bestAsk : (m.marketPrice!=null?m.marketPrice:50);
+  return m.bestBid!=null ? 100-m.bestBid : (m.marketPrice!=null?100-m.marketPrice:50);
+}
+// buyPrice() always falls back to marketPrice/50 when there's nothing resting
+// to trade against, so it can never signal "no liquidity" on its own — a user
+// would see a plausible-looking price, click it, and only find out it fails
+// after submitting. This is the actual signal: bestAsk/bestBid null means the
+// matcher has nothing on that side right now (house side skipped by the risk
+// gate, or between requote cycles).
+function hasLiquidity(m, side){
+  return side==='YES' ? m.bestAsk!=null : m.bestBid!=null;
+}
+function toast(msg){ const t=$('toast'); t.textContent=msg; t.classList.remove('hidden'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.add('hidden'),2200); }
+
+async function doLogin(){
+  const name = $('name').value.trim(); if(!name) return;
+  U = await api('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  localStorage.setItem('bitbull_user', JSON.stringify(U)); showApp();
+}
+function logout(){ localStorage.removeItem('bitbull_user'); location.reload(); }
+async function doRoundReset(){
+  if(!confirm('Reset ALL wallets, positions and P&L for everyone? Names stay logged in.')) return;
+  const r = await api('/api/round-reset',{method:'POST'});
+  toast(r.ok?`🔄 Round reset — ${r.usersReset} wallets refreshed`:'Reset failed');
+  refresh();
+}
+function showApp(){ $('login').classList.add('hidden'); $('app').classList.remove('hidden'); $('uname').textContent=U.name; $('bal').textContent=money(U.balance); loop(); }
+async function updateWallet(){ try{ const p=await api('/api/portfolio?userId='+U.userId); $('bal').textContent=money(p.balance); }catch{} }
+
+function tab(t){
+  // The nav buttons call tab() directly, not via location.hash — so leaving a
+  // market's detail page through Markets/Portfolio/Hedge Desk never ran
+  // exitDetail()'s cleanup. tab-detail stayed visible (its own hidden class
+  // was never toggled here) and its background timers (countdown, order-book
+  // poll) kept running, so the just-viewed 5m market stayed on screen under —
+  // or instead of — the tab you clicked into.
+  if(DETAIL){
+    DETAIL=null; disconnectDetailWs(); clearInterval(obTimer); obTimer=null;
+    if(location.hash) history.replaceState(null,'',location.pathname+location.search); // clear without a hashchange round-trip
+  }
+  TAB=t;
+  ['markets','portfolio','mm','liq'].forEach(x=>{ $('tab-'+x).classList.toggle('hidden',x!==t); });
+  $('tab-detail').classList.add('hidden');
+  document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));
+  refresh();
+}
+
+// ── ticket ── Market (taker, one-click, executes against bestAsk/bestBid,
+// may partial-fill, never rests) or Limit (maker, user picks the price, rests
+// on the book until filled or cancelled — see the order-book Cancel buttons
+// in refreshOrderBook()).
+let TICK=null;
+function openTicket(marketId, side){ const m=MKTS[marketId]; if(!m) return;
+  // Belt-and-braces: the button's own disabled state should already stop
+  // this, but MKTS can be a poll cycle stale (up to ~1-2s) relative to what's
+  // rendered, so re-check the real signal here too rather than trust the
+  // click alone.
+  if(!hasLiquidity(m, side)){ toast(`⚠️ No liquidity on ${side} right now — try again shortly`); return; }
+  TICK={m,side,qty:10,orderType:'market',price:buyPrice(m,side)}; renderTicket(); }
+function ticketPrice(){ const {m,side}=TICK; return buyPrice(m,side); }
+// Limit orders default to the MID price, not ticketPrice() (the exact
+// crossing price) — a limit priced right at the touch is marketable and
+// fills immediately, which made every default-price limit order behave like
+// a market order and show "Filled" instead of demonstrating a resting order.
+// Mid sits inside the spread so it won't cross on entry; still one click away
+// from the crossing price if the user wants to submit a marketable limit.
+function defaultLimitPrice(m, side){
+  const {bestBid,bestAsk}=m;
+  if(bestBid!=null && bestAsk!=null){
+    const midYes = Math.round(((bestBid+bestAsk)/2)*10)/10;
+    return side==='YES' ? midYes : Math.round((100-midYes)*10)/10;
+  }
+  return buyPrice(m, side);
+}
+function setOrderType(t){ TICK.orderType=t; if(t==='limit') TICK.price=defaultLimitPrice(TICK.m, TICK.side); renderTicket(); }
+function effectivePrice(){ return TICK.orderType==='limit' ? TICK.price : ticketPrice(); }
+function renderTicket(){
+  const {m,side,qty,orderType}=TICK; const px = effectivePrice();
+  const cost = (qty*px/100);
+  const contracts = (qty);
+  const isLimit = orderType==='limit';
+  $('modal').innerHTML = `<div class="ticket">
+    <h3>${m.question}</h3><div class="sub">Strike $${m.strike} · settles in ${fmtCd(m.tauSec)}</div>
+    <span class="pill ${side==='YES'?'yes':'no'}">${side}</span>
+    <div class="seg-toggle">
+      <button class="${!isLimit?'active':''}" onclick="setOrderType('market')">Market</button>
+      <button class="${isLimit?'active':''}" onclick="setOrderType('limit')">Limit</button>
+    </div>
+    ${isLimit
+      ? `<div class="mut" style="margin:12px 0">Rests on the book until filled or cancelled — may not fill immediately.</div>
+         <div class="qtyrow"><span class="mut">Limit price</span><input id="tprice" type="number" step="0.1" min="0.1" max="99.9" value="${px}" oninput="TICK.price=Math.max(0.1,Math.min(99.9,parseFloat(this.value)||0.1));renderCost()"><span>¢</span></div>`
+      : `<div class="mut" style="margin:12px 0">Executes immediately against available liquidity at ${px}¢</div>`}
+    <div class="qtyrow"><button onclick="qadj(-10)">–</button><input id="tqty" value="${qty}" oninput="TICK.qty=Math.max(1,parseInt(this.value)||1);renderCost()"><button onclick="qadj(10)">+</button></div>
+    <div class="costrow"><span>Contracts</span><b id="tcontracts">${contracts}</b></div>
+    <div class="costrow"><span>Price</span><b id="tpx">${px}¢</b></div>
+    <div class="costrow"><span>Cost</span><b id="tcost">${money(cost)}</b></div>
+    <div class="costrow"><span>Max payout</span><b id="tpayout">${money(qty)}</b></div>
+    <button class="btn-primary place" onclick="place()">${isLimit?'Place':'Buy'} ${side} · ${money(cost)}</button>
+    <button class="cancel" onclick="closeTicket()">Cancel</button></div>`;
+  $('modal').classList.remove('hidden');
+}
+function qadj(d){ TICK.qty=Math.max(1,TICK.qty+d); $('tqty').value=TICK.qty; renderCost(); }
+function renderCost(){ const px=effectivePrice(); const {qty,side,orderType}=TICK; if($('tpx'))$('tpx').textContent=px+'¢'; $('tcost').textContent=money(qty*px/100); if($('tcontracts'))$('tcontracts').textContent=qty; if($('tpayout'))$('tpayout').textContent=money(qty); const btn=document.querySelector('.place'); if(btn) btn.textContent=`${orderType==='limit'?'Place':'Buy'} ${side} · ${money(qty*px/100)}`; }
+function closeTicket(){ $('modal').classList.add('hidden'); TICK=null; }
+async function place(){
+  const {m,side,qty,orderType,price}=TICK;
+  const body={userId:U.userId,marketId:m.marketId,side,orderType,qty};
+  if(orderType==='limit') body.price=price;
+  const r = await api('/api/trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  closeTicket();
+  if(r.ok){
+    if(r.filledQty===0) toast(`📌 Order resting — ${r.bidCount}@${r.bidAmount}¢, will fill when matched`);
+    else if(r.filledQty<r.requestedQty) toast(`✅ Filled ${r.filledQty}/${r.requestedQty} ${side}${orderType==='limit'?' — remainder resting':' (partial — no more liquidity)'}`);
+    else toast(`✅ ${orderType==='limit'?'Filled':'Bought'} ${r.filledQty} ${side}`);
+  } else toast(`⚠️ ${r.message}`);
+  refresh();
+}
+
+function fmtCd(s){ s=Math.max(0,s|0); const m=(s/60)|0; return `${m}:${String(s%60).padStart(2,'0')}`; }
+
+// ── wallet statement (click the balance chip) ──
+// Private to the logged-in user: only ever requests our own userId.
+async function openWallet(){
+  if(!U) return;
+  const w = await api('/api/wallet?userId='+encodeURIComponent(U.userId)+'&limit=100').catch(()=>null);
+  if(!w){ toast('Could not load wallet'); return; }
+  const rows = (w.transactions||[]).map(t=>{
+    const t0 = new Date(t.at); const when = isNaN(t0) ? '' : t0.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    return `<tr><td class=mut style="white-space:nowrap">${when}</td><td>${t.note||t.kind}</td>
+      <td class="${t.amount<0?'neg':'pos'}" style="text-align:right;white-space:nowrap">${t.amount<0?'':'+'}${money(t.amount)}</td>
+      <td style="text-align:right;white-space:nowrap">${money(t.balanceAfter)}</td></tr>`;
+  }).join('') || '<tr><td colspan=4 class=mut>No transactions yet</td></tr>';
+  $('modal').innerHTML = `<div class="ticket" style="max-width:560px">
+    <h3>Wallet</h3><div class="sub">${U.name} · private to you</div>
+    <div class="stat" style="margin-bottom:14px"><div class="k">Balance</div><div class="v">${money(w.balance)}</div></div>
+    <div style="max-height:320px;overflow:auto">
+      <table><thead><tr><th>Time</th><th>Detail</th><th style="text-align:right">Amount</th><th style="text-align:right">Balance</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+    </div>
+    <button class="cancel" onclick="closeTicket()">Close</button></div>`;
+  $('modal').classList.remove('hidden');
+}
+
+// ── market detail page (live BTC chart, market-price chart, order book) ──
+let DETAIL=null, priceHistory=[], probHistory=[], detailWs=null, obTimer=null, drawScheduled=false, drawTimer=null, lastDrawAt=0;
+
+function openDetail(marketId){ location.hash='#/market/'+marketId; }
+window.addEventListener('hashchange', routeHash);
+function routeHash(){
+  const m = location.hash.match(/^#\/market\/(.+)$/);
+  if(m) enterDetail(m[1]); else exitDetail();
+}
+async function enterDetail(marketId){
+  const d = await api('/api/markets').catch(()=>null);
+  const mkt = d && d.markets.find(x=>x.marketId===marketId && !x.expired);
+  if(!mkt){ toast('Market not found — it may have settled'); location.hash=''; return; }
+  DETAIL = mkt; MKTS[marketId] = mkt; priceHistory=[]; probHistory=[];
+  if(d.spot){ const now=Date.now();
+    pushChartPoint(priceHistory, now, d.spot);
+    const mp = mkt.marketPrice!=null ? mkt.marketPrice : mkt.lastTrade;
+    if(mp!=null) pushChartPoint(probHistory, now, mp); }
+  document.querySelectorAll('main > section').forEach(s=>s.classList.add('hidden'));
+  $('tab-detail').classList.remove('hidden');
+  document.querySelectorAll('nav button').forEach(b=>b.classList.remove('active'));
+  renderDetailHeader();
+  connectDetailWs();
+  refreshOrderBook(); clearInterval(obTimer); obTimer=setInterval(refreshOrderBook, 2000);
+}
+function exitDetail(){
+  DETAIL=null; disconnectDetailWs(); clearInterval(obTimer); obTimer=null;
+  $('tab-detail').classList.add('hidden');
+  tab(TAB);
+}
+function renderDetailHeader(){
+  $('d-q').textContent = DETAIL.question;
+  $('d-strike').textContent = DETAIL.strike;
+  $('d-cd').textContent = fmtCd(DETAIL.tauSec);
+  if($('d-cd2')) $('d-cd2').textContent = fmtCd(DETAIL.tauSec);
+  const by = buyPrice(DETAIL,'YES'), bn = buyPrice(DETAIL,'NO');
+  const yesOk = hasLiquidity(DETAIL,'YES'), noOk = hasLiquidity(DETAIL,'NO');
+  $('d-yesprice').textContent = (yesOk?by.toFixed(1)+'¢':'—')+' YES';
+  $('d-noprice').textContent = (noOk?bn.toFixed(1)+'¢':'—')+' NO';
+  $('d-yesbtn').textContent = yesOk?by.toFixed(1)+'¢':'No liquidity';
+  $('d-nobtn').textContent = noOk?bn.toFixed(1)+'¢':'No liquidity';
+  if($('d-yesbutton')) $('d-yesbutton').classList.toggle('disabled', !yesOk);
+  if($('d-nobutton')) $('d-nobutton').classList.toggle('disabled', !noOk);
+}
+function updateDetailCountdown(){
+  if(!DETAIL) return;
+  DETAIL.tauSec = Math.max((DETAIL.expiryTs-Date.now())/1000,1);
+  $('d-cd').textContent = fmtCd(DETAIL.tauSec);
+  if($('d-cd2')) $('d-cd2').textContent = fmtCd(DETAIL.tauSec);
+}
+
+// live Binance WS (direct from the browser — public stream, no key needed).
+// Watchdog: a stalled socket can sit "open" without delivering data (sleep/
+// wake, network change) — force a reconnect if nothing arrives for 15s, rather
+// than trusting close/error to fire.
+let detailWsLastMsg = 0, detailWsWatchdog = null;
+function connectDetailWs(){
+  disconnectDetailWs();
+  try{ detailWs = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@trade'); }catch{ return; }
+  detailWsLastMsg = Date.now();
+  detailWs.onmessage = (ev)=>{
+    if(!DETAIL) return;
+    detailWsLastMsg = Date.now();
+    try{
+      const p = parseFloat(JSON.parse(ev.data).p); if(!(p>0)) return;
+      const now = Date.now();
+      pushChartPoint(priceHistory, now, p);
+      // Market price (Layer 3, real tradable price) only changes when the
+      // order book actually changes — NOT on every raw BTC trade tick like
+      // this handler fires. Its updates come from the 2s poll (refreshOrderBook)
+      // instead, which reads the server's real bestBid/bestAsk/lastTrade.
+      setTextIfPresent('d-spot', '$'+p.toFixed(1));
+      scheduleDraw();
+    }catch{}
+  };
+  detailWs.onclose = ()=>{ if(DETAIL) setTimeout(connectDetailWs, 1500); };
+  detailWs.onerror = ()=>{ try{ detailWs.close(); }catch{} };
+  clearInterval(detailWsWatchdog);
+  detailWsWatchdog = setInterval(()=>{
+    if(DETAIL && Date.now()-detailWsLastMsg > 15000) connectDetailWs();
+  }, 5000);
+}
+function disconnectDetailWs(){
+  clearInterval(detailWsWatchdog); detailWsWatchdog=null;
+  if(detailWs){ const w=detailWs; detailWs=null; w.onclose=null; try{ w.close(); }catch{} }
+}
+
+const CHART_MAX_WINDOW_MS = 6 * 60 * 1000;
+const CHART_DRAW_INTERVAL_MS = 250;
+const CHART_BUCKET_TARGET = 90;
+const CHART_EMA_ALPHA = 0.32;
+// Floor on the y-span, as a fraction of price. Only wide enough that pure tick
+// noise can't fill the frame — 0.35% (~$230 at 66k) left ~70% of the chart
+// empty and made every market look identically flat. 0.12% (~$80) lets real
+// moves use the space while still damping $2 jitter.
+const CHART_MIN_SPAN_PCT = 0.0012;
+
+function pushChartPoint(series, t, v){
+  if(!(v >= 0) || !Number.isFinite(v)) return;
+  series.push({t, v});
+  const cutoff = t - CHART_MAX_WINDOW_MS;
+  while(series.length > 1 && series[0].t < cutoff) series.shift();
+}
+
+function scheduleDraw(){
+  const now = Date.now();
+  const wait = Math.max(0, CHART_DRAW_INTERVAL_MS - (now - lastDrawAt));
+  if(drawScheduled) return;
+  drawScheduled = true;
+  clearTimeout(drawTimer);
+  drawTimer = setTimeout(()=>{
+    requestAnimationFrame(()=>{
+      drawScheduled = false;
+      lastDrawAt = Date.now();
+      renderDetailCharts();
+    });
+  }, wait);
+}
+function renderDetailCharts(){
+  if(!DETAIL) return;
+  // The renderer manages its own y-scale (data + small padding). The strike
+  // is a calm horizontal reference, not the axis anchor — the trader's real
+  // question is "where are we vs the strike?", and a tight auto-scale makes
+  // the answer readable at a glance without amplifying noise.
+  renderBtcChart($('chart-price'), priceHistory, {
+    color: '#eef2f8',
+    refLine: DETAIL.strike,
+    expiryTs: DETAIL.expiryTs,
+    fmtPrice: (v) => '$' + v.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ','),
+    tooltipTitle: 'BTC Price',
+  });
+  renderProbChart($('chart-prob'), probHistory, {
+    tooltipTitle: 'YES market price',
+  });
+  // Headline answer to "am I winning, and by how much?" — previously only
+  // discoverable by hovering the line.
+  const spot = priceHistory.length ? priceHistory[priceHistory.length-1].v : null;
+  const dEl = $('d-dist');
+  if(dEl && spot != null && DETAIL.strike){
+    const diff = spot - DETAIL.strike;
+    dEl.textContent = (diff >= 0 ? '▲ $' : '▼ $') + Math.abs(diff).toFixed(0) + (diff >= 0 ? ' above strike' : ' below strike');
+    dEl.className = 'dist ' + (diff >= 0 ? 'pos' : 'neg');
+  }
+}
+// ── calm prediction-market chart (Kalshi/Polymarket style) ──
+// Store every feed update in a time window, but draw a trader-readable view:
+// adaptive last-price buckets, light EMA display smoothing, and a true latest
+// endpoint so the chart feels calm without lying about the current price.
+function resampleBuckets(series, bucketMs){
+  if(!series || !series.length) return [];
+  const out = [];
+  let bucket = Math.floor(series[0].t / bucketMs);
+  let last = series[0];
+  for(let i=1;i<series.length;i++){
+    const p = series[i];
+    const b = Math.floor(p.t / bucketMs);
+    if(b === bucket){ last = p; continue; }
+    out.push(last);
+    bucket = b;
+    last = p;
+  }
+  out.push(last);
+  if(out.length === 1 && series.length > 1 && series[0].t !== out[0].t) out.unshift(series[0]);
+  return out;
+}
+
+function smoothEma(points, alpha = CHART_EMA_ALPHA){
+  if(points.length < 3) return points.map(p=>({t:p.t, v:p.v, rawV:p.v}));
+  const out = [];
+  let ema = points[0].v;
+  for(const p of points){
+    ema = alpha * p.v + (1 - alpha) * ema;
+    out.push({t:p.t, v:ema, rawV:p.v});
+  }
+  return out;
+}
+
+function displaySeries(series){
+  if(!series || !series.length) return { bucketed: [], smooth: [], latest: null, bucketMs: 1000 };
+  const windowMs = series.length > 1 ? Math.max(1, series[series.length - 1].t - series[0].t) : 0;
+  const bucketMs = Math.max(1000, Math.ceil(windowMs / CHART_BUCKET_TARGET));
+  const bucketed = resampleBuckets(series, bucketMs);
+  const smooth = smoothEma(bucketed);
+  const latest = series[series.length - 1];
+  if(smooth.length){
+    smooth[smooth.length - 1] = { t: latest.t, v: latest.v, rawV: latest.v };
+    bucketed[bucketed.length - 1] = latest;
+  }
+  return { bucketed, smooth, latest, bucketMs };
+}
+
+function stableYRange(canvas, values, opts){
+  if(opts.yRange) return opts.yRange;
+  let minY = Math.min(...values), maxY = Math.max(...values);
+  const mid = (minY + maxY) / 2;
+  const dataSpan = Math.max(maxY - minY, Math.abs(mid) * CHART_MIN_SPAN_PCT, 1e-6);
+  const pad = dataSpan * 0.06;
+  let nextMin = mid - dataSpan / 2 - pad;
+  let nextMax = mid + dataSpan / 2 + pad;
+  const prev = canvas._yRange;
+  if(prev && Number.isFinite(prev[0]) && Number.isFinite(prev[1])){
+    if(minY >= prev[0] && maxY <= prev[1]){
+      nextMin = prev[0] + (nextMin - prev[0]) * 0.12;
+      nextMax = prev[1] + (nextMax - prev[1]) * 0.12;
+    } else {
+      nextMin = Math.min(nextMin, minY - pad);
+      nextMax = Math.max(nextMax, maxY + pad);
+    }
+  }
+  canvas._yRange = [nextMin, nextMax];
+  return canvas._yRange;
+}
+
+function ensureChartHover(canvas){
+  if(canvas._hoverReady) return;
+  canvas._hoverReady = true;
+  canvas.addEventListener('mousemove', (ev) => {
+    const meta = canvas._chartMeta;
+    if(!meta || !meta.points.length) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = (ev.clientX - rect.left) * meta.dpr;
+    const clamped = Math.max(meta.padL, Math.min(meta.W - meta.padR, x));
+    const targetT = meta.minX + ((clamped - meta.padL) / meta.plotW) * (meta.maxX - meta.minX);
+    let lo = 0, hi = meta.points.length - 1;
+    while(lo < hi){
+      const mid = Math.floor((lo + hi) / 2);
+      if(meta.points[mid].t < targetT) lo = mid + 1; else hi = mid;
+    }
+    const prev = Math.max(0, lo - 1);
+    canvas._hover = Math.abs(meta.points[prev].t - targetT) < Math.abs(meta.points[lo].t - targetT) ? prev : lo;
+    scheduleDraw();
+  });
+  canvas.addEventListener('mouseout', () => { canvas._hover = null; scheduleDraw(); });
+}
+
+function renderBtcChart(canvas, series, opts){
+  if(!canvas) return;
+  const dpr = window.devicePixelRatio||1;
+  ensureChartHover(canvas);
+  const cssW = Math.max(1, canvas.clientWidth);
+  const cssH = Math.max(1, canvas.clientHeight);
+  const targetW = Math.round(cssW*dpr), targetH = Math.round(cssH*dpr);
+  if(canvas.width !== targetW || canvas.height !== targetH){
+    canvas.width = targetW; canvas.height = targetH;
+    canvas._yRange = null;
+  }
+  const W = canvas.width, H = canvas.height;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+
+  const padL = 64*dpr, padR = 28*dpr, padT = 36*dpr, padB = 30*dpr;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  if(plotW <= 0 || plotH <= 0) return;
+
+  const { bucketed, smooth, latest } = displaySeries(series);
+  if(bucketed.length < 2 || smooth.length < 2){ canvas._chartMeta = null; drawEmpty(ctx, W, H, padL, padT, plotW, plotH, opts); return; }
+
+  const minX = bucketed[0].t, maxX = latest.t;
+  const rawVals = bucketed.map(p=>p.v).concat(latest.v);
+  // The strike is ALWAYS in view. The old guard only added it when it already
+  // sat inside the data range — circular, so once spot drifted away from the
+  // strike the reference line silently fell off the chart, exactly when knowing
+  // the distance matters most.
+  if(opts.refLine != null) rawVals.push(opts.refLine);
+  const [minY, maxY] = stableYRange(canvas, rawVals, opts);
+  const X = t => padL + (t - minX) / ((maxX - minX) || 1) * plotW;
+  const Y = v => padT + (1 - (v - minY) / ((maxY - minY) || 1)) * plotH;
+
+  ctx.strokeStyle = 'rgba(35,43,61,0.30)';
+  ctx.lineWidth = 1 * dpr;
+  for(let i=1; i<=2; i++){
+    const gy = padT + (i * plotH / 3);
+    ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(W - padR, gy); ctx.stroke();
+  }
+
+  const strike = opts.refLine;
+  // Winning side drives the whole palette: above the strike YES pays out, below
+  // it NO does. A neutral white line on a faint grey reference made the trader
+  // decode the numbers to answer "am I winning?" — colour answers it instantly.
+  const above = strike == null || latest.v >= strike;
+  const lineColor = strike == null ? (opts.color || '#e6e9ef') : (above ? '#22c55e' : '#ef4444');
+
+  if(strike != null && strike >= minY && strike <= maxY){
+    const yRef = Y(strike);
+    // YES zone above / NO zone below — tinted just enough to read at a glance
+    // without competing with the price line.
+    ctx.fillStyle = 'rgba(34,197,94,0.055)';
+    ctx.fillRect(padL, padT, plotW, Math.max(0, yRef - padT));
+    ctx.fillStyle = 'rgba(239,68,68,0.055)';
+    ctx.fillRect(padL, yRef, plotW, Math.max(0, padT + plotH - yRef));
+
+    ctx.save();
+    ctx.setLineDash([5*dpr, 4*dpr]);
+    ctx.strokeStyle = '#94a3b8';
+    ctx.lineWidth = 1.5 * dpr;
+    ctx.beginPath(); ctx.moveTo(padL, yRef); ctx.lineTo(W - padR, yRef); ctx.stroke();
+    ctx.restore();
+    // Anchor the strike label LEFT. The live price label is pinned to the right
+    // edge, so a right-aligned strike label collided with it exactly when spot
+    // sat near the strike — the moment the chart is most worth reading.
+    ctx.fillStyle = '#c3ccdb';
+    ctx.font = '600 ' + (11 * dpr) + 'px ui-sans-serif, system-ui, -apple-system, sans-serif';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('strike ' + opts.fmtPrice(strike), padL + 6*dpr, Math.max(padT + 12*dpr, yRef - 6*dpr));
+  }
+
+  ctx.strokeStyle = lineColor;
+  ctx.lineWidth = 2 * dpr;
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.beginPath();
+  smooth.forEach((p, i) => {
+    const x = X(p.t), y = Y(p.v);
+    if(i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  const ex = X(latest.t), ey = Y(latest.v);
+  ctx.fillStyle = lineColor;
+  ctx.beginPath(); ctx.arc(ex, ey, 4 * dpr, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#eef2f8';
+  ctx.font = '600 ' + (13 * dpr) + 'px ui-sans-serif, system-ui, -apple-system, sans-serif';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  const endLabel = opts.fmtPrice(latest.v);
+  const labelW = ctx.measureText(endLabel).width;
+  const labelX = ex + 9*dpr + labelW > W - 4*dpr ? Math.max(padL, ex - 9*dpr - labelW) : ex + 9*dpr;
+  ctx.fillText(endLabel, labelX, ey - 2 * dpr);
+
+  ctx.fillStyle = '#8a95a8';
+  ctx.font = (11 * dpr) + 'px ui-sans-serif, system-ui, -apple-system, sans-serif';
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  ctx.fillText(opts.fmtPrice(maxY), padL - 8*dpr, padT + 4*dpr);
+  ctx.fillText(opts.fmtPrice((minY+maxY)/2), padL - 8*dpr, padT + plotH/2);
+  ctx.fillText(opts.fmtPrice(minY), padL - 8*dpr, padT + plotH - 4*dpr);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  // Label the axis by TIME LEFT, not wall clock. On a 5-minute binary "01:41"
+  // told you nothing; "2:30 left" places every point against the only deadline
+  // that matters. Falls back to clock time if the market's expiry is unknown.
+  const pad2 = (n) => (n < 10 ? '0' + n : '' + n);
+  const fmtT = (ms) => {
+    if(opts.expiryTs){
+      const left = Math.max(0, Math.round((opts.expiryTs - ms) / 1000));
+      return left <= 0 ? 'settle' : Math.floor(left/60) + ':' + pad2(left % 60);
+    }
+    const d = new Date(ms);
+    return (maxX - minX > 3600*1000)
+      ? pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds())
+      : pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  };
+  for(let i=0; i<=3; i++){
+    const t = minX + (i * (maxX - minX) / 3);
+    ctx.fillText(fmtT(t), padL + i * plotW / 3, padT + plotH + 8*dpr);
+  }
+
+  canvas._chartMeta = { dpr, W, padL, padR, plotW, minX, maxX, points: bucketed };
+
+  if(canvas._hover != null && canvas._hover >= 0 && canvas._hover < bucketed.length){
+    const p = bucketed[canvas._hover];
+    const px = X(p.t), py = Y(p.v);
+    ctx.strokeStyle = 'rgba(230,233,239,0.22)';
+    ctx.lineWidth = 1 * dpr;
+    ctx.beginPath(); ctx.moveTo(px, padT); ctx.lineTo(px, padT + plotH); ctx.stroke();
+    ctx.fillStyle = opts.color || '#e6e9ef';
+    ctx.beginPath(); ctx.arc(px, py, 4 * dpr, 0, Math.PI * 2); ctx.fill();
+
+    const tipW = 154*dpr, tipH = opts.refLine != null ? 48*dpr : 34*dpr;
+    const tipX = Math.max(padL + 6*dpr, Math.min(px + 10*dpr, W - padR - tipW));
+    const tipY = padT + 6*dpr;
+    ctx.fillStyle = 'rgba(20,25,37,0.92)';
+    ctx.fillRect(tipX - 8*dpr, tipY - 6*dpr, tipW, tipH);
+    const labelA = (opts.tooltipTitle || 'Price') + '  ' + opts.fmtPrice(p.v);
+    const labelB = opts.tooltipTime ? opts.tooltipTime(p.t) : fmtT(p.t);
+    ctx.font = '600 ' + (12 * dpr) + 'px ui-sans-serif, system-ui, -apple-system, sans-serif';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillStyle = '#eef2f8'; ctx.fillText(labelA, tipX, tipY);
+    ctx.font = (11 * dpr) + 'px ui-sans-serif, system-ui, -apple-system, sans-serif';
+    ctx.fillStyle = '#8a95a8'; ctx.fillText(labelB, tipX, tipY + 16*dpr);
+    if(opts.refLine != null){
+      const diff = p.v - opts.refLine;
+      const dist = (diff >= 0 ? '+' : '') + opts.fmtPrice(diff).replace('$-', '-$');
+      ctx.fillText(dist + ' vs strike', tipX, tipY + 31*dpr);
+    }
+  }
+}
+
+function drawEmpty(ctx, W, H, padL, padT, plotW, plotH, opts){
+  ctx.fillStyle = '#8a95a8';
+  ctx.font = '12px ui-sans-serif, system-ui, -apple-system, sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('collecting data...', padL + plotW/2, padT + plotH/2);
+}
+
+// prob chart: same renderer, fixed 0–100% range, accent color, percent format
+function renderProbChart(canvas, series, opts){
+  return renderBtcChart(canvas, series, Object.assign({
+    color: '#5b8cff',
+    yRange: [0, 100],
+    fmtPrice: (v) => v.toFixed(1) + '¢',
+    tooltipTitle: 'YES market price',
+  }, opts || {}));
+}
+
+// order book + resting-order counts (also keeps DETAIL's server-quoted prices fresh)
+async function refreshOrderBook(){
+  if(!DETAIL) return;
+  const [ob, d] = await Promise.all([
+    api('/api/orderbook?marketId='+encodeURIComponent(DETAIL.marketId)).catch(()=>({yes:[],no:[]})),
+    api('/api/markets').catch(()=>null),
+  ]);
+  if(!DETAIL) return; // navigated away while awaiting
+  if(d){
+    const fresh = d.markets.find(x=>x.marketId===DETAIL.marketId && !x.expired);
+    if(fresh){ DETAIL=fresh; MKTS[DETAIL.marketId]=fresh; renderDetailHeader(); }
+    else if(location.hash.includes(DETAIL.marketId)){ toast('This market has settled'); location.hash=''; return; }
+    // Feed the charts from the SERVER spot on every 2s poll. The direct
+    // browser→Binance WS (connectDetailWs) is the fast path, but it can be
+    // blocked (ngrok, corp network, mobile) — leaving the chart stuck at its
+    // single seed point and never drawing. This
+    // server-fed fallback guarantees both charts always fill.
+    if(d.spot){ const now=Date.now();
+      pushChartPoint(priceHistory, now, d.spot);
+      setTextIfPresent('d-spot', '$'+d.spot.toFixed(1));
+      scheduleDraw();
+    }
+    if(fresh){ const now=Date.now();
+      const mp = fresh.marketPrice!=null ? fresh.marketPrice : fresh.lastTrade;
+      if(mp!=null){ pushChartPoint(probHistory, now, mp); setTextIfPresent('d-prob', mp.toFixed(1)+'¢'); }
+      else setTextIfPresent('d-prob', 'no market yet');
+      scheduleDraw();
+    }
+  }
+  const resting = (ob.yes||[]).concat(ob.no||[]).filter(r=>!r.matched).length;
+  $('d-obcount').textContent = `${resting} resting order${resting===1?'':'s'}`;
+  // Aggregated, price-sorted depth ladder (best price first) — matches how
+  // Kalshi/Polymarket present a book. Previously rendered one row per raw
+  // order, sorted by row_id (insertion order) — a freshly-placed order could
+  // land anywhere in the list regardless of its actual price rank, which read
+  // as "my order jumped to the top" rather than taking its real position.
+  const ladder = (arr, side) => {
+    const resting = (arr||[]).filter(r=>!r.matched);
+    if(!resting.length) return '<div class="empty">No resting orders</div>';
+    const byPrice = new Map();
+    for(const r of resting){
+      const g = byPrice.get(r.price) || {price:r.price, qty:0, mine:false, who:new Map()};
+      g.qty += r.qty;
+      const mine = U && String(r.userId)===String(U.userId);
+      if(mine) g.mine = true;
+      // Per-contributor breakdown at this price level — other users' resting
+      // size is visible by name (or "you"), same as the original per-order
+      // table did, just now grouped under the price-sorted aggregate instead
+      // of listed in row_id order.
+      const key = String(r.userId);
+      const w = g.who.get(key) || {name: mine ? 'you' : r.who, qty:0, mine};
+      w.qty += r.qty;
+      g.who.set(key, w);
+      byPrice.set(r.price, g);
+    }
+    const levels = [...byPrice.values()].sort((a,b)=>b.price-a.price);
+    const maxQty = Math.max(...levels.map(l=>l.qty));
+    return levels.map(l=>{
+      const pct = Math.max(6, Math.round(l.qty/maxQty*100));
+      const cancelBtn = l.mine ? `<button class="ob-cancel" onclick="cancelOrder('${side}')" title="Cancel your resting order">✕</button>` : '';
+      const contributors = [...l.who.values()].sort((a,b)=>b.qty-a.qty)
+        .map(w=>`<span class="${w.mine?'you':''}">${w.name} ${w.qty}</span>`).join(', ');
+      return `<div class="level${l.mine?' mine':''}"><div class="bar" style="width:${pct}%"></div>
+        <div class="lmain"><span class="lprice">${l.price.toFixed(1)}¢${l.mine?'<span class="you">YOU</span>':''}</span>
+        <span class="lqty">${l.qty}${cancelBtn}</span></div>
+        <div class="lwho">${contributors}</div></div>`;
+    }).join('');
+  };
+  $('d-book-yes').innerHTML = ladder(ob.yes, 'yes');
+  $('d-book-no').innerHTML = ladder(ob.no, 'no');
+}
+// Cancels ALL of the current user's resting orders on this side of this
+// market (cancel-order.js backend scope, see app/server.mjs cancelOrder()) —
+// not a single-row cancel. Fine here: the ticket only ever lets one limit
+// order rest per side per market at a time in normal use.
+async function cancelOrder(side){
+  if(!DETAIL || !U) return;
+  const r = await api('/api/cancel-order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:U.userId,marketId:DETAIL.marketId,side})});
+  if(r.ok) toast(`✅ Order cancelled — ${money(r.refundAmount/100)} refunded`);
+  else toast(`⚠️ ${r.message}`);
+  refreshOrderBook(); updateWallet();
+}
+
+// ── render ──
+async function refresh(){
+  if(!U) return;
+  if(TAB==='markets'){ if(TICK) return; const d=await api('/api/markets'); $('spot').textContent=d.spot?'$'+d.spot.toFixed(0):'–';
+    const live=d.markets.filter(m=>!m.expired); MKTS=Object.fromEntries(live.map(m=>[m.marketId,m]));
+    const ids=live.map(m=>m.marketId).join(',');
+    if(ids!==LASTIDS){ LASTIDS=ids;
+      $('markets').innerHTML = live.map(m=>`<div class="mkt" data-id="${m.marketId}" data-expiry="${m.expiryTs}" onclick="openDetail('${m.marketId}')">
+        <div class="q">${m.question}</div>
+        <div class="meta"><span>Strike $${m.strike}</span><span class="cd">⏱ <span class="cdv">${fmtCd(m.tauSec)}</span></span>
+          <span class="mp">${m.marketPrice!=null?m.marketPrice.toFixed(1)+'¢ mid':'no market yet'}</span></div>
+        <div class="sides">
+          <button class="side yes${hasLiquidity(m,'YES')?'':' disabled'}" onclick="event.stopPropagation();openTicket('${m.marketId}','YES')"><div class="lab">YES</div><div class="px pxy">${hasLiquidity(m,'YES')?buyPrice(m,'YES').toFixed(1)+'¢':'No liquidity'}</div></button>
+          <button class="side no${hasLiquidity(m,'NO')?'':' disabled'}" onclick="event.stopPropagation();openTicket('${m.marketId}','NO')"><div class="lab">NO</div><div class="px pxn">${hasLiquidity(m,'NO')?buyPrice(m,'NO').toFixed(1)+'¢':'No liquidity'}</div></button>
+        </div></div>`).join('') || '<div class="mut">Opening the next market…</div>';
+    } else { // update prices in place (no DOM churn → no dropped clicks)
+      live.forEach(m=>{ const el=document.querySelector(`.mkt[data-id="${m.marketId}"]`); if(!el)return;
+        // data-expiry only — NOT .cdv text. tickMarketCountdowns() owns that
+        // display every second, computed live from data-expiry; this poll's
+        // m.tauSec is a snapshot from up to 1s ago (server-cached) and writing
+        // it here fought the smooth local tick, causing the seconds to visibly
+        // jump backward/forward — the "glitchy" countdown.
+        el.dataset.expiry = m.expiryTs;
+        el.querySelector('.mp').textContent=m.marketPrice!=null?m.marketPrice.toFixed(1)+'¢ mid':'no market yet';
+        const yesOk=hasLiquidity(m,'YES'), noOk=hasLiquidity(m,'NO');
+        const yesBtn=el.querySelector('.side.yes'), noBtn=el.querySelector('.side.no');
+        yesBtn.classList.toggle('disabled', !yesOk); noBtn.classList.toggle('disabled', !noOk);
+        el.querySelector('.pxy').textContent=yesOk?buyPrice(m,'YES').toFixed(1)+'¢':'No liquidity';
+        el.querySelector('.pxn').textContent=noOk?buyPrice(m,'NO').toFixed(1)+'¢':'No liquidity'; });
+    }
+  }
+  if(TAB==='portfolio'){ const p=await api('/api/portfolio?userId='+U.userId); $('bal').textContent=money(p.balance);
+    $('p-bal').textContent=money(p.balance); $('p-real').innerHTML=`<span class="${sign(p.realized)}">${money(p.realized)}</span>`;
+    $('p-open').textContent = p.openCount!=null ? p.openCount : p.positions.filter(x=>x.live).length;
+    // OPEN = still has risk. A position leaves this table the moment its market
+    // settles; it reappears below as a closed, paid-out record.
+    $('p-pos').innerHTML = p.positions.map(x=>{
+      const status = x.live ? '' : '<span class=mut style="font-size:11px"> settling…</span>';
+      return `<tr><td>≥$${x.strike}${status}</td><td class="${x.side==='YES'?'pos':'neg'}">${x.side}</td><td>${x.qty}</td><td>${x.avgPrice}¢</td><td>${x.mark}¢</td><td class="${sign(x.unrealized)}">${money(x.unrealized)}</td></tr>`;
+    }).join('')||'<tr><td colspan=6 class=mut>No open positions — go to Markets</td></tr>';
+    $('p-hist').innerHTML = (p.history||[]).map(x=>
+      `<tr><td>≥$${x.strike} <span class="${x.outcome==='WON'?'pos':'neg'}" style="font-size:11px;font-weight:700">${x.outcome}</span></td><td class="${x.side==='YES'?'pos':'neg'}">${x.side}</td><td>${x.qty}</td><td>${x.avgPrice}¢</td><td>${x.mark}¢</td><td class="${sign(x.realizedPnl)}">${money(x.realizedPnl)}</td></tr>`
+    ).join('')||'<tr><td colspan=6 class=mut>Nothing settled yet</td></tr>';
+  }
+  if(TAB==='mm'){ const m=await api('/api/mm');
+    $('m-net').innerHTML=`<span class="${sign(m.netPnl)}">${money(m.netPnl)}</span>`;
+    $('m-vig').textContent=money(m.quotedSpreadRevenue); $('m-hpnl').innerHTML=`<span class="${sign(m.hedgePnl)}">${money(m.hedgePnl)}</span>`;
+    $('m-realspread').innerHTML=`<span class="${sign(m.realizedSpreadRevenue)}">${money(m.realizedSpreadRevenue)}</span>`;
+    $('m-fee').textContent=money(m.feeRevenue);
+    $('m-invpnl').innerHTML=`<span class="${sign(m.inventoryPnl)}">${money(m.inventoryPnl)}</span>`;
+    $('m-inv').innerHTML=`<span class="${sign(m.settlementPnl)}">${money(m.settlementPnl)}</span>`; $('m-vol').textContent=m.volume;
+    $('c-fillrate').textContent=(m.quoteFillRate*100).toFixed(1)+'%';
+    $('c-adverse').innerHTML=`<span class="${sign(-m.adverseSelection)}">${m.adverseSelection.toFixed(2)}¢</span>`;
+    $('c-turnover').textContent=m.inventoryTurnover.toFixed(2);
+    $('c-efficiency').textContent=(m.spreadCaptureEfficiency*100).toFixed(0)+'%';
+    const h=m.hedge;
+    const skewPct = h && h.skewOffsetPct!=null ? (h.skewOffsetPct*100) : null;
+    const skewColor = skewPct==null ? 'var(--sub)' : skewPct>=90 ? 'var(--yes)' : skewPct>=70 ? 'var(--sub)' : 'var(--no)';
+    $('m-hedge').innerHTML = h ? `<div class="hedge-badge ${h.position>0?'yes':h.position<0?'no':''}" style="background:${h.position>0?'var(--yes-bg)':h.position<0?'var(--no-bg)':'var(--card2)'};color:${h.position>0?'var(--yes)':h.position<0?'var(--no)':'var(--sub)'}">${h.position>0?'LONG':h.position<0?'SHORT':'FLAT'} ${Math.abs(h.position).toFixed(4)} BTC</div>
+      <div class="mut" style="margin-top:10px">aggregate δ ${h.aggregateDelta.toFixed(4)} · notional ${money(h.notionalUsdt)} · ${h.armed?'armed':(h.idle||'idle')} · venue ${h.venue}</div>
+      <div style="margin-top:6px">skew offset by hedging: <span style="color:${skewColor};font-weight:600">${skewPct==null?'n/a':skewPct.toFixed(1)+'%'}</span>
+        <span class="mut" title="dollar-offset ratio: 1 − Σ|target−position|·mark / Σ|target|·mark, accumulated since last reset">(${money(h.cumTargetUsdt||0)} skew seen, ${money(h.cumResidualUsdt||0)} left unhedged)</span></div>` : '<div class="mut">hedging service offline</div>';
+    $('m-board').innerHTML = m.board.map((b,i)=>`<tr><td>${i+1}. ${b.name}</td><td style="text-align:right" class="${sign(b.pnl)}">${money(b.pnl)}</td></tr>`).join('')||'<tr><td class=mut>no settled P&L yet</td></tr>';
+    $('m-log').innerHTML = (m.log||[]).join('<br>');
+  }
+  if(TAB==='liq'){ const w=await api('/api/liquidity-watch').catch(()=>null);
+    const ageSec = w && w.updatedAt ? (Date.now()-w.updatedAt)/1000 : null;
+    const dead = w==null || w.stale || ageSec>10;
+    $('liq-status').innerHTML = dead ? '<span class="neg">⚠ watcher offline</span>' : '<span class="pos">● live</span>';
+    $('liq-lastupdate').textContent = ageSec==null ? '–' : (ageSec<1?'just now':ageSec.toFixed(0)+'s ago');
+    const active = (w&&w.activeAlerts)||[];
+    $('liq-active').innerHTML = active.length ? `<span class="neg">${active.length}</span>` : '<span class="pos">0</span>';
+    $('liq-active-rows').innerHTML = active.map(a=>
+      `<tr><td>${a.marketId}</td><td class="${a.side==='yes'?'pos':'neg'}">${a.side.toUpperCase()}</td><td class="neg">${(a.emptyMs/1000).toFixed(1)}s</td><td>${a.tauAtStart.toFixed(0)}s</td></tr>`
+    ).join('')||'<tr><td colspan=4 class=mut>Nothing empty right now</td></tr>';
+    $('liq-gap-rows').innerHTML = ((w&&w.recentGaps)||[]).map(g=>
+      `<tr><td>${g.marketId}</td><td class="${g.side==='yes'?'pos':'neg'}">${g.side.toUpperCase()}</td><td>${(g.durationMs/1000).toFixed(1)}s</td><td>${g.tauAtStart.toFixed(0)}s</td><td class=mut>${new Date(g.resolvedAt).toLocaleTimeString()}</td></tr>`
+    ).join('')||'<tr><td colspan=5 class=mut>No gaps recorded yet</td></tr>';
+  }
+  // header wallet + spot always
+  const s=await api('/api/markets').catch(()=>({})); if(s.spot)$('spot').textContent='$'+s.spot.toFixed(0);
+}
+function tickMarketCountdowns(){
+  document.querySelectorAll('.mkt[data-expiry]').forEach(el=>{
+    const exp = +el.dataset.expiry;
+    if (!exp) return;
+    const tau = Math.max(0, (exp - Date.now())/1000);
+    const cd = el.querySelector('.cdv');
+    if (cd && cd.textContent !== fmtCd(tau)) cd.textContent = fmtCd(tau);
+  });
+}
+
+async function loop(){ await refresh(); updateWallet(); routeHash(); setInterval(updateWallet, 3000);
+  setInterval(()=>{
+    if(DETAIL){ updateDetailCountdown(); return; }
+    if(TAB==='markets'){
+      tickMarketCountdowns();   // local 1s tick from data-expiry — survives server cache staleness
+      refresh();                // slower-changing data (prices, market list)
+    }
+    if(TAB==='liq') refresh();  // watcher state changes sub-second — keep it live while the tab is open
+  }, 1000); }
+
+$('name').addEventListener('keydown',e=>{ if(e.key==='Enter') doLogin(); });
+if(U) showApp();
+</script></body></html>

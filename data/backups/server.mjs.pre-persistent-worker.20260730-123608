@@ -1,0 +1,866 @@
+// Multi-user trading app for the office test. Real people log in (just a name),
+// get a wallet, and trade live 5-minute BTC markets against the house MMP + each
+// other. A shared MM/Hedge Desk tab shows the live hedge, spread capture, and P&L.
+// Everything routes through GameBull's real trading-api → matcher → distribution.
+//
+//   node app/server.mjs           (serves the app on :5050)
+// Expose with ngrok: `ngrok http 5050`  (all URLs are relative → tunnel-safe).
+import http from 'node:http';
+import { readFile } from 'node:fs/promises';
+import fs from 'node:fs';
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import Redis from 'ioredis';
+import mysql from 'mysql2/promise';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, ScanCommand, UpdateCommand, DeleteCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
+import { REGION, DDB_ENDPOINT, AWS_CREDS, REDIS, MYSQL, MMP_USER_ID } from '../setup/local.mjs';
+import { digitalProbYes, empiricalProbYes, toTick, cancelRestingRows } from '../drivers/lib/pricing.mjs';
+import { walkBook } from '../drivers/lib/matching.mjs';
+import { settleFill } from '../drivers/lib/fees.mjs';
+import { recordAggressiveFill, orderFlowImbalance } from '../drivers/lib/flow.mjs';
+
+const PORT = Number(process.env.APP_PORT || 5050);
+const TRADING_API = process.env.TRADING_API || 'http://localhost:8080';
+const HEDGING_SVC = process.env.HEDGING_SERVICE || 'http://localhost:8790';
+const WALLET_STUB = process.env.WALLET_STUB || 'http://localhost:3000';
+const MMP_API_KEY = process.env.MMP_API_KEY || 'localkey';
+const SIGMA = 0.0004;
+// Same toggle/env-var name as drivers/mmp-pricing/index.mjs's own
+// EMPIRICAL_FAIR_VALUE — MUST move together with mmp-pricing's copy, or the
+// P&L accounting below (realized spread, adverse selection, inventoryPnl,
+// portfolio mark) measures against a different curve than what mmp-pricing
+// actually quoted off of, producing fake ~30pp+ "edge" numbers from the two
+// curves disagreeing, not real skill. Now DEFAULT ON, matching mmp-pricing.
+// Rollback: MMP_EMPIRICAL_FAIR_VALUE=0 (needs this process restarted).
+const EMPIRICAL_FAIR_VALUE = process.env.MMP_EMPIRICAL_FAIR_VALUE !== '0';
+const EMPIRICAL_REF_SEC = Number(process.env.MMP_EMPIRICAL_REF_SEC || 300);
+function fairValueYes(spot, strike, tauSec) {
+  return EMPIRICAL_FAIR_VALUE
+    ? empiricalProbYes(spot, strike, tauSec, EMPIRICAL_REF_SEC)
+    : digitalProbYes(spot, strike, SIGMA, tauSec);
+}
+const HALF_SPREAD = 3;          // ¢ vig per side (matches mmp-pricing)
+// ¢ grid — must match the market's inputPriceInterval (market-generator's
+// PRICE_INTERVAL, now 0.1 — see that file's comment for why not 0.01).
+const TICK = Number(process.env.PRICE_INTERVAL || 0.1);
+// ¢ of headroom added to a market order's swept-book limit price, so a quote
+// refresh landing between our book snapshot and the matcher doesn't leave the
+// order short-filled. Costs a little extra wallet reservation, never extra fill
+// price (the matcher still prices each fill off the resting bid it crosses).
+const SLIPPAGE_BUFFER = Number(process.env.MARKET_SLIPPAGE_BUFFER || 2);
+// Wallet is in "points" (a contract costs `price` points 0-100, pays 100 = $1).
+// Seed 100000 points = $1,000. API returns balances in dollars (points/100).
+const START_BALANCE = 100000;
+const SYMBOL = 'BTCUSDT';
+
+const __dir = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.join(__dir, '..');
+const redis = new Redis(REDIS);
+const db = await mysql.createPool(MYSQL);
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION, endpoint: DDB_ENDPOINT, credentials: AWS_CREDS }));
+
+const log = [];
+const addLog = (m) => { log.unshift(`${new Date().toISOString().slice(11, 19)}  ${m}`); log.length = Math.min(log.length, 60); };
+
+// 1s memo cache for the shared read endpoints (identical for every user) so N
+// concurrent office users don't multiply the DynamoDB scans.
+const _cache = new Map();
+async function cached(key, ms, fn) {
+  const c = _cache.get(key);
+  if (c && Date.now() - c.t < ms) return c.v;
+  const v = await fn(); _cache.set(key, { t: Date.now(), v }); return v;
+}
+
+// Persistent, rotated-by-truncation driver log — mmp-pricing's output was
+// previously captured into `out` and discarded on process close, so a
+// reported liquidity issue could never be traced back after the fact (hit
+// this gap twice now investigating live reports). Purely additive: `out`
+// and the resolved value are unchanged, this just also appends to disk.
+const DRIVER_LOG = path.join(ROOT, 'data', 'driver.log');
+const DRIVER_LOG_MAX = 2_000_000; // truncate past ~2MB so this never grows unbounded
+// spawnedAt/closedAt let a reader tell apart the two distinct possible
+// bottlenecks: a big gap between spawnedAt and the PREVIOUS cycle's closedAt
+// means the TRIGGER was delayed (server.mjs's own event loop/timers starved
+// of CPU); a big (closedAt-spawnedAt) on this cycle itself means the spawned
+// child process (fork/exec + module load + DB round trips) was slow once it
+// actually got scheduled — previously indistinguishable since only a single
+// close-time timestamp was logged.
+function appendDriverLog(rel, args, out, spawnedAt, closedAt) {
+  try {
+    if (!out.trim()) return;
+    const durMs = closedAt - spawnedAt;
+    const line = `\n[spawned ${new Date(spawnedAt).toISOString()} · closed ${new Date(closedAt).toISOString()} · ${durMs}ms] ${rel} ${args.join(' ')}\n${out.trim()}\n`;
+    if (fs.existsSync(DRIVER_LOG) && fs.statSync(DRIVER_LOG).size > DRIVER_LOG_MAX) fs.writeFileSync(DRIVER_LOG, '');
+    fs.appendFileSync(DRIVER_LOG, line);
+  } catch { /* best-effort — never let logging break the trading path */ }
+}
+function runDriver(rel, args = []) {
+  return new Promise((res) => {
+    const spawnedAt = Date.now();
+    const p = spawn('node', [path.join(ROOT, rel), ...args], { cwd: ROOT });
+    let out = ''; p.stdout.on('data', (d) => (out += d)); p.stderr.on('data', (d) => (out += d));
+    p.on('close', () => { appendDriverLog(rel, args, out, spawnedAt, Date.now()); res(out.trim()); });
+  });
+}
+// Guards every repeated/concurrent-risk mmp-pricing trigger (fill-driven,
+// fair-value-change, lockout-zone, safety-net) against overlapping cycles —
+// a single cycle measures ~0.5-0.7s (process spawn + cancel/repost round
+// trips to the matcher), so an occasional slow cycle could otherwise let a
+// new requote fire mid-cancel/repost, risking duplicate or missed resting
+// rows.
+//
+// Per-market lock (a Set of in-flight marketIds), not a single shared lock.
+// History: originally keyed by `id || '*'` (a distinct key per market, '*'
+// for the unscoped/all-markets safety-net call) — found live (2026-07-29)
+// that this let a scoped call for market X and the unscoped '*' call run as
+// two literally concurrent `node mmp-pricing/index.mjs` processes at once,
+// since '*' isn't the same key as X even though the unscoped run internally
+// requotes X too. Both processes raced cancel/repost on the SAME market's
+// order book, producing a repeatedly-reproducible fully-empty book. The fix
+// at the time was to collapse to a SINGLE global lock — correct, but it
+// serializes ALL markets behind one flag: with only 1-2 concurrent markets
+// this was invisible, but running a genuine multi-tenor ladder (2026-07-30)
+// exposed real starvation — every 3s tick, only the FIRST market that needed
+// a requote actually ran; every other market that tick was silently dropped,
+// and if the same early-iterated market kept tripping the fair-value-delta
+// trigger on every subsequent tick too, later markets could go UNQUOTED
+// INDEFINITELY (reproduced live: 15m/1h markets sat at "No liquidity" for
+// 10+ minutes with real time left, while the co-located 5m market kept
+// getting fresh quotes every cycle). Fixed properly this time: key the lock
+// PER MARKET ID (restoring the original intent), and make the unscoped
+// safety-net call decompose into one independently-locked per-market call
+// each, instead of a single process that internally loops every market. That
+// removes the '*' vs X key mismatch that caused the original race BY
+// CONSTRUCTION — both trigger paths now always go through the exact same
+// per-market key for a given market — while restoring true cross-market
+// parallelism (as many concurrent quote cycles as there are markets needing
+// one, each still guaranteed non-overlapping with itself).
+const requoteInFlight = new Set();
+function requestRequote(id) {
+  if (id) {
+    if (requoteInFlight.has(id)) return;
+    requoteInFlight.add(id);
+    runDriver('drivers/mmp-pricing/index.mjs', [id]).finally(() => requoteInFlight.delete(id));
+    return;
+  }
+  redis.smembers('predictor_active_markets').then((ids) => ids.forEach((mid) => requestRequote(mid))).catch(() => {});
+}
+const spot = async () => { const r = await redis.get(`CRYPTO_SPOT_${SYMBOL}`); return r ? JSON.parse(r).price : null; };
+const meta = async (mkt) => { const r = await redis.get(`MMP_MARKET_META_${mkt}`); return r ? JSON.parse(r) : null; };
+
+// ── users ───────────────────────────────────────────────────────────────────
+async function login(name) {
+  name = String(name || '').trim().slice(0, 24) || 'anon';
+  const key = name.toLowerCase();
+  let uid = await redis.hget('app:users', key);
+  if (!uid) {
+    uid = String(200001 + (await redis.incr('app:uidseq')) - 1);
+    await redis.hset('app:users', key, uid);
+    await redis.hset('app:names', uid, name);
+    await db.query('INSERT INTO bb_users (user_id, unused_amount) VALUES (?, ?) ON DUPLICATE KEY UPDATE user_id = user_id', [uid, START_BALANCE]);
+    addLog(`👤 ${name} joined (wallet $${START_BALANCE})`);
+  }
+  const [[row]] = [await db.query('SELECT unused_amount FROM bb_users WHERE user_id = ?', [uid])];
+  return { userId: uid, name, balance: Number(row?.[0]?.unused_amount ?? 0) / 100 };
+}
+
+// ── markets ─────────────────────────────────────────────────────────────────
+async function activeMarkets() {
+  const ids = await redis.smembers('predictor_active_markets');
+  const s = await spot();
+  const scan = await ddb.send(new ScanCommand({ TableName: 'market' }));
+  const byId = Object.fromEntries((scan.Items || []).map((m) => [m.marketId, m]));
+  const out = [];
+  for (const id of ids) {
+    const mt = await meta(id); if (!mt) continue;
+    const tau = Math.max((mt.expiryTs - Date.now()) / 1000, 1);
+    const yesP = s ? Math.round(fairValueYes(s, mt.strike, tau) * 100) : 50;
+    // Layer 3 (market price discovery) — what users actually see/transact
+    // against. Layer 1 (fairYes, theoretical) is kept for the analytics/detail
+    // context only, never shown as the tradable price (plan §4 three-layer model).
+    const book = await orderBook(id);
+    const { bestBid, bestAsk } = bestBidAsk(book);
+    const lt = await lastTrade(id);
+    out.push({
+      marketId: id, question: byId[id]?.question?.en || `BTC ≥ $${mt.strike}?`,
+      strike: mt.strike, expiryTs: mt.expiryTs, tauSec: Math.round(tau),
+      fairYes: Math.min(97, Math.max(3, yesP)), fairNo: Math.min(97, Math.max(3, 100 - yesP)),
+      bestBid, bestAsk, lastTrade: lt, marketPrice: marketPriceOf(bestBid, bestAsk, lt),
+      expired: mt.expiryTs <= Date.now(),
+    });
+  }
+  return out.sort((a, b) => a.expiryTs - b.expiryTs);
+}
+
+// ── market vs limit orders + price terminology (plan §4) ─────────────────────
+// bestBid/bestAsk/midPrice/lastTrade/marketPrice — never collapsed into one
+// number. Users transact at bestBid/bestAsk, never at marketPrice (display-only).
+function bestBidAsk(book) {
+  const restingYes = book.yes.filter((r) => !r.matched).map((r) => r.price);
+  const restingNo = book.no.filter((r) => !r.matched).map((r) => r.price);
+  const bestBid = restingYes.length ? Math.max(...restingYes) : null;
+  const bestNoBid = restingNo.length ? Math.max(...restingNo) : null;
+  const bestAsk = bestNoBid != null ? Number((100 - bestNoBid).toFixed(4)) : null;
+  return { bestBid, bestAsk };
+}
+function marketPriceOf(bestBid, bestAsk, lastTrade) {
+  return (bestBid != null && bestAsk != null) ? Number(((bestBid + bestAsk) / 2).toFixed(4)) : lastTrade;
+}
+async function lastTrade(marketId) {
+  const raw = await redis.lindex(`app:lasttrade:${marketId}`, 0);
+  return raw ? Number(raw) : null;
+}
+async function recordLastTrade(marketId, priceCents) {
+  const key = `app:lasttrade:${marketId}`;
+  await redis.lpush(key, priceCents);
+  await redis.ltrim(key, 0, 19);
+  await redis.expire(key, 3600);
+}
+
+// ── trade (through the real trading-api) ─────────────────────────────────────
+// Market orders achieve IOC-*intent* via app-layer executable-depth capping
+// (walk the book in matcher price-priority order, cap qty to what's actually
+// fillable) + post-trade residual cleanup — not a claim of atomic
+// exchange-level IOC, since the matcher itself is out of scope to change.
+// Limit orders are the only order type allowed to intentionally rest.
+async function trade({ userId, marketId, side, orderType = 'market', price, qty }) {
+  const optionId = side === 'YES' ? 1 : 2;
+  let bidAmount, submitQty = Math.max(1, Math.floor(Number(qty)));
+  const requestedQty = submitQty;
+
+  const book = await orderBook(marketId);
+  const preTradeBook = (side === 'YES' ? book.no : book.yes).filter((r) => !r.matched);
+
+  if (orderType === 'market') {
+    const { availableQty, consumed } = walkBook(preTradeBook, submitQty);
+    if (availableQty <= 0) return { ok: false, message: 'No liquidity available for market order', bidAmount: 0, bidCount: 0, filledQty: 0, requestedQty };
+    submitQty = availableQty; // cap to what's actually fillable at matcher-correct price priority
+    // Price the sweep off the book we just walked, NOT a blanket 99¢ sentinel.
+    // The trading-api debits the wallet at (bidAmount × qty), so submitting 99¢
+    // reserved ~99¢/contract for an order that fills near 59¢ — a ~40%
+    // over-reservation that made large market orders fail on "Insufficient
+    // wallet balance" while liquidity was plentiful. `consumed` holds exactly
+    // the rows this order will cross; the worst user-side price among them is
+    // 100 − (lowest opposite bid consumed). Submitting there still crosses every
+    // intended level, reserves close to the true cost, and doubles as slippage
+    // protection if the book moves before the matcher sees us.
+    const worstUserPrice = 100 - Math.min(...consumed.map((r) => r.price));
+    bidAmount = toTick(Math.min(100 - TICK, worstUserPrice + SLIPPAGE_BUFFER), TICK);
+  } else {
+    bidAmount = toTick(Number(price), TICK); // limit order, user's chosen price; unmatched remainder rests
+  }
+
+  const r = await fetch(`${TRADING_API}/skillPolls/placeBid`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', user_id: String(userId), api_key: MMP_API_KEY, mmp_price_version: '0' },
+    body: JSON.stringify({ marketId, option: { bidAmount, bidCount: submitQty, optionId }, mmp: { isHedge: 0 } }),
+  });
+  const body = await r.json().catch(() => ({}));
+  const ok = !!body?.status;
+  const submittedBidId = body?.response?.bidInfo?.bidId;
+  let filledQty = 0;
+
+  if (ok) {
+    const who = await redis.hget('app:names', userId) || userId;
+
+    // Actual-fill-based (not pre-trade prediction), split by order type —
+    // found live (2026-07-29) that neither signal alone is reliable for both:
+    //
+    // MARKET orders are depth-capped to guaranteed-fillable liquidity before
+    // submission (walkBook() above), so "no residual row left under this
+    // user in the order book" is a reliable fully-filled signal here — the
+    // depth-cap guarantee is exactly why. Kept as-is.
+    //
+    // LIMIT orders have no such guarantee — resting is a genuinely valid
+    // outcome, not just an unfinished-match state. The order-book-absence
+    // check can't tell "fully filled" apart from "not yet resting because
+    // the real matcher's async round-trip hasn't finished writing it" — under
+    // heavy concurrent CPU load (a Kronos fine-tune competing for the
+    // machine), genuinely-resting limit orders (confirmed resting seconds
+    // later via a direct order-book check) were reported as 100% filled
+    // purely because the fixed-delay window ran out too early. Fixed by
+    // reading the bid's own pending-bid record (written synchronously by
+    // writePendingBid, before the real matcher ever sees the order — see
+    // placeBid() in drivers/lib/pricing.mjs) and using matchedBidsCount, the
+    // field already trusted elsewhere in this codebase (portfolio()'s
+    // open-position filter, cancelRestingRows's conditional delete) for "how
+    // much of this bid has actually matched". Note matchedBidsCount lags
+    // further behind the wallet debit / MySQL row deletion than the
+    // order-book check does — confirmed live it's meaningfully less current
+    // for market orders, which is why market orders keep the order-book
+    // check instead of switching to this too.
+    await new Promise((res) => setTimeout(res, 600)); // settle delay
+    const after = await orderBook(marketId);
+    const mine = (side === 'YES' ? after.yes : after.no).filter((r2) => !r2.matched && r2.userId === Number(userId));
+    if (orderType === 'market') {
+      const restingQty = mine.reduce((s, r2) => s + r2.qty, 0);
+      filledQty = submitQty - restingQty;
+      if (mine.length) await cancelRestingRows(marketId, side.toLowerCase(), userId, db, ddb); // sweep any accidental residual
+    } else if (submittedBidId) {
+      try {
+        const rec = await ddb.send(new GetCommand({
+          TableName: 'bb_pending_bids',
+          Key: { marketId: `${marketId}.${userId}`, bidId: submittedBidId },
+        }));
+        if (rec.Item) filledQty = Number(rec.Item.matchedBidsCount ?? 0);
+      } catch { /* transient — filledQty stays 0, the conservative default */ }
+    }
+    // (limit orders are the only order type allowed to intentionally rest — no sweep)
+
+    if (filledQty > 0) {
+      await recordLastTrade(marketId, bidAmount);
+      const touchedHouse = preTradeBook.some((r2) => r2.userId === MMP_USER_ID);
+      await recordAggressiveFill(marketId, { side: side.toLowerCase(), qty: filledQty, price: bidAmount, timestamp: Date.now() });
+      if (touchedHouse) requestRequote(marketId); // instant event-driven re-quote
+
+      if (submittedBidId) {
+        const mt = await meta(marketId);
+        const s = await spot();
+        const fairValueYesAtFill = () => (mt && s) ? fairValueYes(s, mt.strike, Math.max((mt.expiryTs - Date.now()) / 1000, 1)) : 0.5;
+        settleFill({
+          marketId, userId, side, submittedBidId, preTradeBook,
+          fairValueYesAtFill, db, ddb, redis, MMP_USER_ID,
+        }).then((result) => {
+          // Log the price actually PAID. `bidAmount` is the sweep limit, not the
+          // execution price — the matcher prices each fill at
+          // 100 − opponentBid — so logging it made every market order look like
+          // it executed at the limit (e.g. "NO 100@99¢" for a 59¢ fill).
+          if (result && !result.skipped) {
+            addLog(`💸 ${who} ${side} ${result.totalQty}@${result.avgExecPriceCents.toFixed(0)}¢${orderType === 'market' ? ' (market)' : ''}`);
+          } else {
+            addLog(`💸 ${who} ${side} ${filledQty}@~${bidAmount}¢${orderType === 'market' ? ' (market)' : ''}`); // fill price unavailable
+          }
+          if (result?.houseShares > 0) scheduleAdverseSelectionCheck(marketId, side, result.houseAvgExecCents);
+        }).catch((e) => addLog(`settleFill err: ${String(e).slice(0, 60)}`));
+      }
+    } else if (submitQty - filledQty > 0) {
+      // Nothing crossed — a limit order now resting. Its limit IS its price.
+      addLog(`📌 ${who} ${side} ${submitQty - filledQty}@${bidAmount}¢ resting`);
+    }
+  }
+
+  return { ok, message: body?.message || body?.title || 'error', bidAmount, bidCount: submitQty, filledQty, requestedQty };
+}
+
+// ── cancel-order (user-initiated, limit orders only) ─────────────────────────
+// GameBull's real cancel path (POST /skillPolls/cancelOrder) dispatches via
+// SQS to a lambda that drivers/sqs-bridge/index.mjs deliberately does NOT
+// drain locally (see its own comment: "Cancel is a separate lambda not
+// exposed over HTTP... would need a repo change -> Stage 1") — calling it here
+// would silently queue a message nobody processes, worse than no cancel
+// button at all. This refunds locally instead, through our own wallet-stub
+// (a component we own, not GameBull's) — a deliberate simplification of the
+// real flow, not a reproduction of it.
+//
+// Mirror of drivers/market-generator/index.mjs's RAKE_PCT (=5), which it
+// writes into every market's `rakePercent` field at creation. GameBull's real
+// debit at placeBid time is bidCount*bidAmount PLUS a rake
+// (HelperUtils.rakeCalculation: bidCount*bidAmount*(rakePercent/100)) —
+// confirmed empirically against real bb_wallet_txns rows (a 20@5c order
+// debited $1.05, a 20@50c order debited $10.50 — both exactly qty*price*1.05,
+// not qty*price). Refunding qty*price alone under-refunds by the rake on
+// every cancel. If market-generator's RAKE_PCT ever changes, this must move
+// with it — same "two places, keep in sync" pattern as EMPIRICAL_FAIR_VALUE.
+const RAKE_PCT = 5;
+async function cancelOrder({ userId, marketId, side }) {
+  const s = String(side || '').toLowerCase();
+  if (!['yes', 'no'].includes(s) || !marketId || !userId) {
+    return { ok: false, message: 'marketId, side, and userId are required' };
+  }
+  const table = `bb_available_bids_${s}_${marketId}`;
+  let rows;
+  try {
+    [rows] = await db.query(
+      `SELECT row_id, bid_amount/100 AS price, current_bid_count AS qty FROM \`${table}\` WHERE user_id = ? AND current_bid_count > 0`,
+      [userId]);
+  } catch { return { ok: false, message: 'No resting order to cancel' }; }
+  if (!rows.length) return { ok: false, message: 'No resting order to cancel' };
+
+  // Snapshot the refund BEFORE deleting — verified against real bb_wallet_txns
+  // rows (see RAKE_PCT comment above). A fill landing in the gap between this
+  // snapshot and the delete below could cause a minor refund/settlement
+  // mismatch — accepted, same class of timing window as trade()'s existing
+  // 400ms settle-delay pattern, not solved with new machinery here.
+  const principal = rows.reduce((sum, r) => sum + Number(r.price) * Number(r.qty), 0);
+  const refundAmount = principal * (1 + RAKE_PCT / 100);
+  const cancelledQty = rows.reduce((sum, r) => sum + Number(r.qty), 0);
+
+  await cancelRestingRows(marketId, s, userId, db, ddb);
+
+  await fetch(`${WALLET_STUB}/wallet/credit`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, amount: refundAmount, note: `order cancelled — ${marketId}` }),
+  }).catch(() => {});
+
+  return { ok: true, cancelledQty, refundAmount };
+}
+
+// ── adverse selection (calibration metric, plan §5 step 7 / §7) ──────────────
+// N seconds after a house fill, re-read fair value and record the movement in
+// the house's UNFAVORABLE direction (house sells YES at 60¢, fair value is
+// 65¢ ten seconds later -> +5 recorded; favorable movement records <=0).
+const ADVERSE_SELECTION_DELAY_MS = 10000;
+function scheduleAdverseSelectionCheck(marketId, side, houseAvgExecCents) {
+  setTimeout(async () => {
+    try {
+      const mt = await meta(marketId);
+      const s = await spot();
+      if (!mt || !s || mt.expiryTs <= Date.now()) return; // already settled — no comparable fair value
+      const tau = Math.max((mt.expiryTs - Date.now()) / 1000, 1);
+      const fairYesLater = fairValueYes(s, mt.strike, tau) * 100;
+      // side==='YES': house's leg was NO (sold YES equivalent at 100-houseAvgExecCents)
+      // side==='NO' : house's leg was YES (bought YES at houseAvgExecCents)
+      const houseYesEquivExec = side === 'YES' ? (100 - houseAvgExecCents) : houseAvgExecCents;
+      const adverse = side === 'YES' ? (fairYesLater - houseYesEquivExec) : (houseYesEquivExec - fairYesLater);
+      await redis.lpush('app:mm:adverseSelection', adverse.toFixed(2));
+      await redis.ltrim('app:mm:adverseSelection', 0, 199);
+    } catch { /* ignore */ }
+  }, ADVERSE_SELECTION_DELAY_MS);
+}
+
+// ── portfolio ────────────────────────────────────────────────────────────────
+async function portfolio(userId) {
+  const [[bal]] = [await db.query('SELECT unused_amount FROM bb_users WHERE user_id = ?', [userId])];
+  const bids = await ddb.send(new ScanCommand({ TableName: 'bb_pending_bids' }));
+  const mine = (bids.Items || []).filter((b) => String(b.userId) === String(userId) && Number(b.matchedBidsCount) > 0);
+  const s = await spot();
+  // Settled markets keep their record in `market` (with the resolved `answer`)
+  // long after MMP_MARKET_META_* is pruned from Redis, so read outcomes here.
+  const mscan = await ddb.send(new ScanCommand({ TableName: 'market' }));
+  const byId = Object.fromEntries((mscan.Items || []).map((m) => [m.marketId, m]));
+  const pos = [];
+  for (const b of mine) {
+    const mkt = String(b.marketId).split('.')[0];
+    const mt = await meta(mkt);
+    const mrec = byId[mkt];
+    const optionId = Number(b.optionId);
+    const qty = Number(b.matchedBidsCount);
+    const avg = Number(b.buyingPrice ?? b.bidAmount);
+    const live = !!mt && mt.expiryTs > Date.now();
+    // A market is settled once it has resolved to an answer (1 = YES, 2 = NO).
+    const answer = mrec?.answer != null ? Number(mrec.answer) : null;
+    const settled = !live && answer != null;
+
+    let mark, pnl;
+    if (settled) {
+      // FINAL, frozen. Previously an expired position was still marked off a
+      // live Black-Scholes fair value with tau pinned at 1s, so its P&L drifted
+      // with spot forever and the position never visibly resolved. A settled
+      // binary is worth exactly 100¢ (won) or 0¢ (lost) — nothing else.
+      // winningAmount is the authoritative payout the distribution engine wrote
+      // and already credited to the wallet; fall back to the answer if unset.
+      mark = optionId === answer ? 100 : 0;
+      const win = b.winningAmount != null ? Number(b.winningAmount) / 100 : (qty * mark) / 100;
+      pnl = +(win - (qty * avg) / 100).toFixed(2);
+    } else {
+      const tau = mt ? Math.max((mt.expiryTs - Date.now()) / 1000, 1) : 1;
+      const fairYes = mt && s ? fairValueYes(s, mt.strike, tau) * 100 : 50;
+      mark = optionId === 1 ? fairYes : 100 - fairYes;
+      pnl = +(qty * (mark - avg) / 100).toFixed(2);
+    }
+
+    pos.push({
+      marketId: mkt, side: optionId === 1 ? 'YES' : 'NO', qty, avgPrice: avg,
+      mark: Math.round(mark),
+      unrealized: settled ? 0 : pnl,   // settled positions carry no open risk
+      realizedPnl: settled ? pnl : 0,  // …their P&L is booked, and frozen
+      strike: mt?.strike ?? mrec?.strike, live, settled,
+      outcome: settled ? (optionId === answer ? 'WON' : 'LOST') : null,
+    });
+  }
+  // A position CLOSES when its 5m market settles: the payout has already hit
+  // the wallet and the P&L is booked into app:realized, so it is no longer a
+  // holding and must not sit in the open-positions table accumulating forever.
+  // It moves to `history` as a closed record. Expired-but-not-yet-settled
+  // positions (a few seconds during the lifecycle tick) stay in `positions`
+  // flagged live:false so the user can see them resolving rather than vanishing.
+  const ts = (id) => Number(String(id).replace(/\D/g, '')) || 0;
+  const open = pos.filter((p) => !p.settled);
+  const history = pos.filter((p) => p.settled)
+    .sort((a, b2) => ts(b2.marketId) - ts(a.marketId))
+    .slice(0, 12);
+  const realized = Number(await redis.hget('app:realized', String(userId)) || 0);
+  return {
+    balance: Number(bal?.[0]?.unused_amount ?? 0) / 100,
+    positions: open,
+    history,
+    openCount: open.filter((p) => p.live).length,
+    realized: +realized.toFixed(2),
+  };
+}
+
+// ── wallet transaction history (per user, private) ───────────────────────────
+// Every movement is scoped to the single requested userId — never a global
+// ledger — so one user's statement can't expose another's activity.
+// NOTE: this app authenticates by userId alone (no session token), so the
+// scoping is only as strong as that. It is the right shape for adding real auth
+// later; don't treat it as a security boundary against a hostile caller.
+async function walletTransactions(userId, limit = 50) {
+  const uid = String(userId || '').replace(/\D/g, '');
+  if (!uid) return { transactions: [], balance: 0 };
+  const [[bal]] = [await db.query('SELECT unused_amount FROM bb_users WHERE user_id = ?', [uid])];
+  let rows = [];
+  try {
+    [rows] = await db.query(
+      `SELECT txn_id, kind, amount, balance_after, note, created_at
+         FROM bb_wallet_txns WHERE user_id = ? ORDER BY txn_id DESC LIMIT ?`,
+      [uid, Math.min(200, Math.max(1, Number(limit) || 50))]);
+  } catch { /* ledger table not created yet — wallet-stub makes it on boot */ }
+  return {
+    balance: Number(bal?.[0]?.unused_amount ?? 0) / 100,
+    transactions: rows.map((r) => ({
+      id: Number(r.txn_id), kind: r.kind,
+      amount: Number(r.amount) / 100,          // points -> dollars for display
+      balanceAfter: Number(r.balance_after) / 100,
+      note: r.note || '', at: r.created_at,
+    })),
+  };
+}
+
+// ── order book (per-market, for the detail page) ─────────────────────────────
+// marketId flows into a raw SQL table name (bb_available_bids_{side}_{marketId} —
+// dynamic table names can't be parameterized), so allowlist it before use. Our
+// own generator always produces `btc5m<digits>`, but this app is reachable over
+// ngrok, so validate rather than trust the query param.
+function safeMarketId(id) {
+  return /^[a-zA-Z0-9_.]{1,64}$/.test(String(id || '')) ? String(id) : null;
+}
+async function orderBook(rawMarketId) {
+  const id = safeMarketId(rawMarketId);
+  const out = { yes: [], no: [] };
+  if (!id) return out;
+  const names = await redis.hgetall('app:names');
+  for (const side of ['yes', 'no']) {
+    try {
+      // `current_bid_count > 0` mirrors the matcher's own candidate query
+      // (AvailableBidsTable.getForReservation). A FULLY-CONSUMED order is left
+      // in the table as current_bid_count = 0 with is_matched = 0 — it is NOT
+      // flagged matched — so filtering on is_matched alone leaves zero-quantity
+      // ghosts in the book. One such ghost (a 99¢ NO order) became the max()
+      // in bestBidAsk() and pinned the YES ask at 100-99 = 1¢ while real
+      // liquidity sat at 50¢. Anything the matcher won't trade against must not
+      // reach pricing, depth-capping, or fee attribution.
+      const [rows] = await db.query(
+        `SELECT row_id, user_id, bid_amount/100 AS price, current_bid_count AS qty, is_matched FROM \`bb_available_bids_${side}_${id}\` WHERE current_bid_count > 0 ORDER BY row_id`);
+      out[side] = rows.map((r) => ({
+        rowId: Number(r.row_id), price: Number(r.price), qty: Number(r.qty), matched: !!r.is_matched,
+        who: Number(r.user_id) === MMP_USER_ID ? 'HOUSE' : (names[r.user_id] || `user ${r.user_id}`),
+        userId: Number(r.user_id),
+      }));
+    } catch { /* table not created yet (market just opened) */ }
+  }
+  return out;
+}
+
+// ── MM / hedge desk ──────────────────────────────────────────────────────────
+async function hedgeService() {
+  try {
+    const r = await fetch(`${HEDGING_SVC}/state`, { signal: AbortSignal.timeout(800) });
+    if (!r.ok) return null; const s = await r.json();
+    return { venue: s.venue, armed: s.gate?.armed, idle: s.gate?.idleReason,
+      aggregateDelta: s.inventory?.aggregateDelta ?? 0, notionalUsdt: s.inventory?.notionalUsdt ?? 0,
+      position: s.hedger?.livePosition ?? 0, hedgePnl: s.hedger?.hedgePnl ?? 0, fees: s.hedger?.feesPaid ?? 0,
+      markets: s.inventory?.markets?.length ?? 0,
+      skewOffsetPct: s.skewOffsetPct ?? null, cumTargetUsdt: s.cumTargetUsdt ?? 0, cumResidualUsdt: s.cumResidualUsdt ?? 0 };
+  } catch { return null; }
+}
+// Unrealized mark-to-market on CURRENTLY-ACTIVE-MARKET house inventory only —
+// reads each active market's own per-market cost basis (built from matched
+// fills only, fees.mjs §5 step 6). The instant a market settles,
+// inventory-mirror prunes its MMP_LMSR_QUANTITY_* keys (existing behavior),
+// so this sum naturally drops that market's contribution to zero at the same
+// moment settlementPnL picks it up below — never double-counted, never dropped.
+async function computeInventoryPnl() {
+  const ids = await redis.smembers('predictor_active_markets');
+  const s = await spot();
+  let total = 0;
+  const skews = [];
+  for (const id of ids) {
+    const mt = await meta(id); if (!mt || !s) continue;
+    const tau = Math.max((mt.expiryTs - Date.now()) / 1000, 1);
+    const fairYes = fairValueYes(s, mt.strike, tau) * 100;
+    const fairNo = 100 - fairYes;
+    const qYesRaw = Number(await redis.get(`MMP_LMSR_QUANTITY_YES_${id}`) || 0);
+    const qNoRaw = Number(await redis.get(`MMP_LMSR_QUANTITY_NO_${id}`) || 0);
+    const houseYes = qNoRaw, houseNo = qYesRaw; // documented inventory-mirror swap
+    skews.push(Math.abs(houseYes - houseNo));
+    const cost = await redis.hgetall(`app:mm:invCost:${id}`);
+    const yesQty = Number(cost.yesQty || 0), yesCostSum = Number(cost.yesCostSum || 0);
+    const noQty = Number(cost.noQty || 0), noCostSum = Number(cost.noCostSum || 0);
+    const avgCostYes = yesQty > 0 ? yesCostSum / yesQty : fairYes;
+    const avgCostNo = noQty > 0 ? noCostSum / noQty : fairNo;
+    total += houseYes * (fairYes - avgCostYes) / 100 + houseNo * (fairNo - avgCostNo) / 100;
+  }
+  const avgAbsSkew = skews.length ? skews.reduce((a, b) => a + b, 0) / skews.length : 0;
+  return { inventoryPnL: total, avgAbsSkew };
+}
+
+async function mmDesk() {
+  const vol = await redis.hgetall('app:mm:volume');
+  const houseMatched = Number(vol.houseUserVolume || 0);
+  const userMatched = Number(vol.userUserVolume || 0);
+  const quotedSpreadRevenue = +(houseMatched * HALF_SPREAD / 100).toFixed(2); // theoretical estimate — efficiency metric only, NOT in netPnL
+  const realizedSpreadRevenue = +Number(await redis.get('app:mm:realizedSpreadRevenue') || 0).toFixed(2);
+  const feeRevenue = +Number(await redis.get('app:mm:feeRevenue') || 0).toFixed(2);
+  const { inventoryPnL, avgAbsSkew } = await computeInventoryPnl();
+  const hs = await hedgeService();
+  const settlementPnL = +Number(await redis.get('app:mm:settledPnl') || 0).toFixed(2); // realized, at final settlement
+  const hedgePnl = hs?.hedgePnl ?? 0, fees = hs?.fees ?? 0;
+  const netPnl = +(realizedSpreadRevenue + feeRevenue + inventoryPnL + hedgePnl + settlementPnL - fees).toFixed(2);
+
+  // calibration metrics (§7) — tune gamma/sigma/k/inventory limits against these
+  const quoteCount = Number(await redis.get('app:mm:quotecount') || 0);
+  const fillCount = Number(await redis.get('app:mm:fillcount') || 0);
+  const quoteFillRate = quoteCount > 0 ? +(fillCount / quoteCount).toFixed(4) : 0;
+  const adverseSamples = (await redis.lrange('app:mm:adverseSelection', 0, 199)).map(Number);
+  const adverseSelection = adverseSamples.length ? +(adverseSamples.reduce((a, b) => a + b, 0) / adverseSamples.length).toFixed(3) : 0;
+  const inventoryTurnover = avgAbsSkew > 0 ? +(houseMatched / avgAbsSkew).toFixed(3) : 0; // first-pass proxy, flagged for refinement
+  const spreadCaptureEfficiency = quotedSpreadRevenue > 0 ? +(realizedSpreadRevenue / quotedSpreadRevenue).toFixed(3) : 0;
+
+  // leaderboard (top users by realized+unrealized)
+  const names = await redis.hgetall('app:names');
+  const realized = await redis.hgetall('app:realized');
+  const board = Object.entries(names).map(([uid, name]) => ({ name, uid, pnl: +Number(realized[uid] || 0).toFixed(2) }))
+    .sort((a, b) => b.pnl - a.pnl).slice(0, 12);
+
+  return {
+    hedge: hs,
+    // P&L — six distinct components; netPnl sums only the realized ones (quotedSpreadRevenue excluded)
+    quotedSpreadRevenue, realizedSpreadRevenue, feeRevenue, inventoryPnl: +inventoryPnL.toFixed(2),
+    hedgePnl: +hedgePnl.toFixed(2), settlementPnl: settlementPnL, fees: +fees.toFixed(2), netPnl,
+    // calibration metrics
+    quoteFillRate, adverseSelection, inventoryTurnover, spreadCaptureEfficiency,
+    volume: houseMatched + userMatched, houseMatched, userMatched, board, log: log.slice(0, 25),
+  };
+}
+
+// ── settlement (reuse the proven chain) + house P&L accrual ──────────────────
+async function settle(marketId) {
+  const mt = JSON.parse(await redis.get(`MMP_MARKET_META_${marketId}`));
+  mt.expiryTs = Date.now() - 1000; await redis.set(`MMP_MARKET_META_${marketId}`, JSON.stringify(mt));
+  await runDriver('drivers/settlement/index.mjs');
+  await fetch(`http://localhost:3010/pt/assign/winning/${marketId}`).catch(() => {});
+  await new Promise((r) => setTimeout(r, 2000));
+  await ddb.send(new UpdateCommand({ TableName: 'market', Key: { marketId }, UpdateExpression: 'SET marketDistributionStatus = :s', ExpressionAttributeValues: { ':s': 3 } }));
+  await fetch(`http://localhost:3010/pt/distribute/winning/${marketId}`).catch(() => {});
+  await new Promise((r) => setTimeout(r, 2000));
+  // pay winners + accrue realized P&L (house side and per-user)
+  const bids = await ddb.send(new ScanCommand({ TableName: 'bb_pending_bids' }));
+  const mkBids = (bids.Items || []).filter((b) => String(b.marketId).startsWith(`${marketId}.`) && Number(b.matchedBidsCount) > 0);
+  let housePnl = 0;
+  for (const b of mkBids) {
+    // UNITS: bb_users.unused_amount and bb_pending_bids.winningAmount are both
+    // in POINTS (100 points = $1; START_BALANCE 100000 = $1000). `stake`/`win`
+    // below are converted to DOLLARS for P&L display, but the wallet must be
+    // credited in POINTS. Passing the dollar figure paid out 100× too little —
+    // a 100-contract win credited 100 points ($1) instead of 10000 ($100).
+    const winPoints = Number(b.winningAmount || 0);
+    const stake = Number(b.matchedBidsCount) * Number(b.buyingPrice ?? b.bidAmount) / 100;
+    const win = winPoints / 100;
+    const pnl = win - stake;
+    if (Number(b.userId) === MMP_USER_ID) housePnl += pnl;
+    else {
+      await redis.hincrbyfloat('app:realized', String(b.userId), pnl.toFixed(2));
+      if (winPoints > 0) await fetch(`${WALLET_STUB}/wallet/batch-process`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batchId: `${marketId}-b`, clientId: 1, txn: [{ user_id: b.userId, unused: winPoints, market_id: marketId, note: `settlement ${marketId}` }] }),
+      }).catch(() => {});
+    }
+  }
+  await redis.incrbyfloat('app:mm:settledPnl', housePnl.toFixed(2));
+  addLog(`⚖️ settled ${marketId} · house ${housePnl >= 0 ? '+' : ''}$${housePnl.toFixed(2)}`);
+}
+
+// ── market lifecycle: always keep a fresh 5m market; settle expired ──────────
+let lifecycleBusy = false;
+async function lifecycle() {
+  if (lifecycleBusy) return; lifecycleBusy = true;
+  try {
+    const ms = await activeMarkets();
+    for (const m of ms) if (m.expired) await settle(m.marketId);
+    const live = (await activeMarkets()).filter((m) => !m.expired);
+    // Exactly ONE market at a time (rolling window): only open a new 5m market
+    // once the current one has expired and been settled+pruned above — never
+    // pre-open a second while the first is still live (that produced overlapping
+    // markets). settlement/index.mjs srem's the expired id, so live.length hits
+    // 0 right after settle(), and the next tick opens the single replacement.
+    if (live.length === 0) {
+      await runDriver('drivers/market-generator/index.mjs');
+      await new Promise((r) => setTimeout(r, 500));
+      await runDriver('drivers/mmp-pricing/index.mjs');   // house seeds both sides
+      addLog('🆕 new 5m market opened + house quoted');
+    }
+  } catch (e) { addLog(`lifecycle err: ${String(e).slice(0, 40)}`); }
+  finally { lifecycleBusy = false; }
+}
+setInterval(lifecycle, 8000);
+lifecycle();
+
+// Three-tier event-driven quote refresh (plan §3): (1) instant on
+// house-touching fill — wired directly into trade(); (2) fair-value-movement
+// change detector — a real trigger condition, not a blind timer, fires only
+// when fair value actually moved past threshold since the last posted quote;
+// (3) unconditional safety net — guards against (2) silently failing to detect
+// a real change (a stuck quote is worse than a slightly-too-frequent one).
+const FAIR_VALUE_REFRESH_THRESHOLD = Number(process.env.MMP_FAIR_VALUE_REFRESH_THRESHOLD || 0.01);
+// Bug found live (2026-07-24): this gate requires a >=1pp fair-value move
+// since the last posted quote — but once fair value saturates near 97-99%
+// (which happens FASTER with the empirical curve than it used to with
+// Black-Scholes), it can stop moving a full point at all, so the gate never
+// fires again. The 60s unconditional safety net is too coarse to reliably
+// land inside mmp-pricing's own 20s expiry-lockout window (EXPIRY_LOCKOUT_SEC
+// in mmp-pricing/index.mjs). Net effect: a market could coast through its
+// entire lockout window on a stale, pre-lockout TWO-SIDED quote, never
+// getting cancelled/re-posted as the favored-side-only lockout quote —
+// confirmed live via a settled market's order book still showing full
+// 12-level ladders on BOTH sides. Fix: unconditionally requote any market
+// within LOCKOUT_REFRESH_BUFFER_SEC of expiry every tick, bypassing the
+// fair-value-delta gate — guarantees mmp-pricing actually runs (and applies
+// its own lockout logic) several times inside that critical final window.
+const LOCKOUT_REFRESH_BUFFER_SEC = Number(process.env.MMP_LOCKOUT_REFRESH_BUFFER_SEC || 30);
+// Tightened 8000ms -> 3000ms (2026-07-24): measured a single mmp-pricing
+// cycle (process spawn + cancel/repost round trips to the local matcher, all
+// localhost — NOT through ngrok, which only carries external browser traffic
+// to the app's own port) at a consistent ~0.5-0.7s. 3000ms leaves ~4x margin
+// above that before two cycles for the same market could overlap — plus the
+// requoteInFlight guard (above) skips a call outright if the previous one for
+// that market hasn't finished, as a second line of defense. Rollback: raise
+// MMP_QUOTE_CHECK_INTERVAL_MS back toward 8000 if this ever looks unstable.
+const QUOTE_CHECK_INTERVAL_MS = Number(process.env.MMP_QUOTE_CHECK_INTERVAL_MS || 3000);
+// Timer-drift instrument (2026-07-30 liquidity investigation): Node's
+// setInterval is not real-time — under CPU contention the OS may not
+// schedule THIS process promptly, so the callback can fire well past its
+// nominal 3000ms. Logging drift here (separately from runDriver's own
+// spawnedAt/closedAt) isolates whether an empty-book gap is caused by the
+// TRIGGER firing late vs. the spawned child process itself running slow
+// once triggered — previously indistinguishable from driver.log alone.
+let lastTickAt = Date.now();
+setInterval(async () => {
+  const firedAt = Date.now();
+  const drift = firedAt - lastTickAt - QUOTE_CHECK_INTERVAL_MS;
+  lastTickAt = firedAt;
+  if (drift > 1000) { // only log meaningful drift, not routine jitter
+    try {
+      fs.appendFileSync(DRIVER_LOG, `\n[${new Date(firedAt).toISOString()}] TIMER DRIFT: quote-check tick fired ${drift}ms late (expected every ${QUOTE_CHECK_INTERVAL_MS}ms)\n`);
+    } catch { /* best-effort */ }
+  }
+  try {
+    const ids = await redis.smembers('predictor_active_markets');
+    const s = await spot();
+    if (!s) return;
+    for (const id of ids) {
+      const mt = await meta(id); if (!mt) continue;
+      const tau = Math.max((mt.expiryTs - Date.now()) / 1000, 1);
+      if (tau <= LOCKOUT_REFRESH_BUFFER_SEC) {
+        requestRequote(id);
+        continue;
+      }
+      const current = fairValueYes(s, mt.strike, tau);
+      const lastQuoted = Number(await redis.get(`app:mm:lastQuoteFair:${id}`));
+      if (!Number.isFinite(lastQuoted) || Math.abs(current - lastQuoted) >= FAIR_VALUE_REFRESH_THRESHOLD) {
+        requestRequote(id);
+      }
+    }
+  } catch { /* ignore */ }
+}, QUOTE_CHECK_INTERVAL_MS);
+setInterval(() => requestRequote(), 60000); // unconditional safety net
+
+// ── round reset (soft) ────────────────────────────────────────────────────────
+// Keeps everyone logged in (names/userIds survive) but zeroes wallets, closes out
+// open positions, clears realized P&L and the MM accumulators, and rolls a fresh
+// market — so the office can run repeated test rounds without re-logging in.
+async function roundReset() {
+  const names = await redis.hgetall('app:names');
+  const uids = Object.keys(names);
+  if (uids.length) {
+    const ph = uids.map(() => '?').join(',');
+    await db.query(`UPDATE bb_users SET unused_amount = ? WHERE user_id IN (${ph})`, [START_BALANCE, ...uids]);
+  }
+  // Wallet statement — the ledger must start empty too, otherwise last round's
+  // debits/credits sit against a freshly-reset balance and the running
+  // balance_after column is nonsense.
+  let txnsCleared = 0;
+  try {
+    const [r] = await db.query('DELETE FROM bb_wallet_txns');
+    txnsCleared = r?.affectedRows ?? 0;
+  } catch { /* table not created yet */ }
+
+  // Per-user + house P&L, and every market-making / calibration accumulator.
+  await redis.del('app:realized', 'app:mm:settledPnl');
+  await redis.del(
+    'app:mm:feeRevenue',           // user-user fee take
+    'app:mm:realizedSpreadRevenue', // realized spread capture
+    'app:mm:volume',                // house/user volume split
+    'app:mm:quotecount', 'app:mm:fillcount', // quoteFillRate inputs
+    'app:mm:adverseSelection',      // calibration sample window
+  );
+  // Per-market keys are wildcards — scan and drop rather than guess names.
+  for (const pat of ['app:mm:invCost:*', 'app:mm:lastQuoteFair:*', 'app:flow:*', 'app:lasttrade:*']) {
+    const keys = await redis.keys(pat);
+    if (keys.length) await redis.del(...keys);
+  }
+
+  // clear all open bids/positions across every market (DynamoDB has no bulk-delete-by-scan-filter)
+  const bids = await ddb.send(new ScanCommand({ TableName: 'bb_pending_bids' }));
+  for (const b of bids.Items || []) await ddb.send(new DeleteCommand({ TableName: 'bb_pending_bids', Key: { marketId: b.marketId, bidId: b.bidId } }));
+  // drop LMSR inventory + active markets so the hedge starts flat too
+  const active = await redis.smembers('predictor_active_markets');
+  for (const id of active) await redis.del(`MMP_LMSR_QUANTITY_YES_${id}`, `MMP_LMSR_QUANTITY_NO_${id}`, `MMP_MARKET_META_${id}`);
+  await redis.del('predictor_active_markets');
+
+  // Hedge P&L lives in the sidecar's memory, not ours — ask it to zero its own
+  // counters. Best-effort: a round reset must not fail because the optional
+  // hedging service is down.
+  let hedgeReset = false;
+  try {
+    const hr = await fetch(`${HEDGING_SVC}/reset`, { method: 'POST', signal: AbortSignal.timeout(2500) });
+    hedgeReset = hr.ok;
+  } catch { /* sidecar offline — nothing to clear */ }
+
+  _cache.clear();
+  addLog(`🔄 ROUND RESET by admin · ${uids.length} wallets reset to $${(START_BALANCE / 100).toFixed(0)} · ${txnsCleared} txns cleared · hedge ${hedgeReset ? 'zeroed' : 'offline'}`);
+  await lifecycle(); // immediately open a fresh market
+  return { ok: true, usersReset: uids.length, txnsCleared, hedgeReset };
+}
+
+// ── HTTP ─────────────────────────────────────────────────────────────────────
+const json = (res, obj, code = 200) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify(obj)); };
+const readBody = (req) => new Promise((r) => { let b = ''; req.on('data', (c) => (b += c)); req.on('end', () => r(b ? JSON.parse(b) : {})); });
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const u = new URL(req.url, 'http://x');
+    if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type' }); return res.end(); }
+    if (u.pathname === '/' || u.pathname === '/index.html') {
+      const html = await readFile(path.join(__dir, 'public/index.html'), 'utf8');
+      // Explicit no-store. With NO cache headers a browser falls back to
+      // heuristic caching and will happily serve a stale index.html — and it
+      // keys that cache per ORIGIN, so the ngrok host kept showing an old build
+      // while localhost:5050 looked current off the same server. The UI is
+      // edited constantly here and is cheap to re-send; never cache it.
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+        Pragma: 'no-cache',
+        Expires: '0',
+      });
+      return res.end(html);
+    }
+    if (u.pathname === '/api/login' && req.method === 'POST') return json(res, await login((await readBody(req)).name));
+    if (u.pathname === '/api/markets') return json(res, await cached('markets', 1000, async () => ({ spot: await spot(), markets: await activeMarkets() })));
+    if (u.pathname === '/api/trade' && req.method === 'POST') return json(res, await trade(await readBody(req)));
+    if (u.pathname === '/api/cancel-order' && req.method === 'POST') return json(res, await cancelOrder(await readBody(req)));
+    if (u.pathname === '/api/portfolio') return json(res, await portfolio(u.searchParams.get('userId')));
+    if (u.pathname === '/api/wallet') return json(res, await walletTransactions(u.searchParams.get('userId'), u.searchParams.get('limit')));
+    if (u.pathname === '/api/mm') return json(res, await cached('mm', 1500, mmDesk));
+    if (u.pathname === '/api/round-reset' && req.method === 'POST') return json(res, await roundReset());
+    if (u.pathname === '/api/orderbook') {
+      const mid = u.searchParams.get('marketId') || '';
+      return json(res, await cached('ob:' + mid, 1000, () => orderBook(mid)));
+    }
+    res.writeHead(404); res.end('not found');
+  } catch (e) { json(res, { error: String(e) }, 500); }
+});
+server.listen(PORT, () => console.log(`[app] office trading app on http://localhost:${PORT}  (ngrok http ${PORT})`));
