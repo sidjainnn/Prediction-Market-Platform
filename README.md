@@ -130,8 +130,9 @@ Shared libraries in `drivers/lib/`: `pricing.mjs` (fair value) ·
 Needs Docker.
 
 ```bash
+cp run/services.env.example run/services.env
 docker compose up -d                 # redis · mysql8 · dynamodb-local · elasticmq · postgres
-node setup/create-schema.mjs         # idempotent bootstrap
+node setup/create-schema.mjs         # idempotent bootstrap — creates every table/schema
 node app/server.mjs                  # :5050 — also spawns the persistent quoter
 ```
 
@@ -145,6 +146,30 @@ node drivers/liquidity-watcher/index.mjs     # optional diagnostics
 The hedging sidecar is a separate service — see
 **[Hedging](https://github.com/sidjainnn/Hedging)**, which reads this stack's
 inventory read-only and neutralises it on Binance perps.
+
+### What you need beyond this repo
+
+Everything needed to recreate the **infrastructure** is here: `docker-compose.yml`
+pulls its images (redis · mysql8 · dynamodb-local · elasticmq · postgres) from
+public registries, `localstack/elasticmq.conf` configures the queues, and
+`setup/create-schema.mjs` bootstraps every table and schema from scratch. Container
+volumes are deliberately *not* in git — they're regenerable state, and they hold
+user rows.
+
+What a clean clone **cannot** get from here are the four production Predictor
+services on the order path. They live in their own repositories:
+
+| Service | Port | Role |
+|---|---|---|
+| trading-api | 8080 | order validation and intake |
+| matching-engine | 7001 | order books, matching, LMSR state |
+| distribution-engine | 7002 | settlement and payout |
+| wallet | 3000 | balances (a stub lives here; accounting is genuine) |
+
+Start those, point `run/services.env` at them, and the stack runs end to end.
+Without them the app boots and quotes, but nothing matches — that seam is the
+whole reason this repo exists, and vendoring their source into it would defeat
+the point of testing against unmodified production code.
 
 ## Deeper reading
 
